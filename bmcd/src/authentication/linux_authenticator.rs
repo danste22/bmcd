@@ -20,8 +20,11 @@ use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
     Error,
 };
+#[cfg(target_os = "linux")]
 use futures::StreamExt;
+#[cfg(target_os = "linux")]
 use inotify::WatchMask;
+#[cfg(target_os = "linux")]
 use inotify::{EventMask, Inotify};
 use std::{
     future::{ready, Ready},
@@ -43,6 +46,7 @@ pub struct LinuxAuthenticator {
     context: Arc<Mutex<LinuxContext>>,
     authentication_path: &'static str,
     realm: &'static str,
+    allow_loopback_bypass: bool,
 }
 
 impl LinuxAuthenticator {
@@ -51,6 +55,7 @@ impl LinuxAuthenticator {
         realm: &'static str,
         authentication_token_duration: Duration,
         authentication_attemps: usize,
+        allow_loopback_bypass: bool,
     ) -> io::Result<Self> {
         let password_entries = Self::parse_shadow_file().await?;
 
@@ -62,6 +67,7 @@ impl LinuxAuthenticator {
             ))),
             authentication_path,
             realm,
+            allow_loopback_bypass,
         };
 
         if let Err(e) = instance.auto_reload().await {
@@ -75,6 +81,14 @@ impl LinuxAuthenticator {
 impl LinuxAuthenticator {
     /// Watches for any changes in the shadow file and reloads the password
     /// cache when a change is detected.
+    #[cfg(not(target_os = "linux"))]
+    async fn auto_reload(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Watches for any changes in the shadow file and reloads the password
+    /// cache when a change is detected.
+    #[cfg(target_os = "linux")]
     async fn auto_reload(&self) -> std::io::Result<()> {
         let inotify = Inotify::init()?;
         let mask = WatchMask::DELETE_SELF | WatchMask::CLOSE_WRITE;
@@ -87,10 +101,10 @@ impl LinuxAuthenticator {
         tokio::spawn(async move {
             while let Some(Ok(event)) = event_stream.next().await {
                 if EventMask::DELETE_SELF == event.mask {
-                    event_stream
-                        .watches()
-                        .add(SHADOW_FILE, mask)
-                        .expect("error rebinding shadow file watcher");
+                    if let Err(e) = event_stream.watches().add(SHADOW_FILE, mask) {
+                        tracing::error!("error rebinding shadow file watcher: {e}");
+                        break;
+                    }
                     continue;
                 }
 
@@ -156,6 +170,7 @@ where
             self.context.clone(),
             self.authentication_path,
             self.realm,
+            self.allow_loopback_bypass,
         )))
     }
 }

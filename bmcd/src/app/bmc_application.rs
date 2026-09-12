@@ -131,8 +131,9 @@ impl BmcApplication {
     ///
     /// returns Err(e) on an internal gpio error or when there is an error
     /// writing power LED status.
+    #[cfg_attr(feature = "stubbed", allow(dead_code))]
     pub async fn toggle_power_states(&self, inverse_toggle: bool) -> anyhow::Result<()> {
-        let node_values = self.app_db.get::<u8>(ACTIVATED_NODES_KEY).await;
+        let node_values = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
 
         let mut on = node_values == 0;
         if inverse_toggle && node_values != 0 && node_values != 0b1111 {
@@ -145,26 +146,60 @@ impl BmcApplication {
 
     async fn initialize(&self) -> anyhow::Result<()> {
         self.initialize_usb_mode().await?;
-        let power_state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
-        self.activate_slot(power_state, 0b1111).await?;
+        self.initialize_power().await?;
         self.initialize_cooling().await
+    }
+
+    /// Prefer live sysfs state so a daemon restart does not flip running nodes.
+    /// When every node reads off (typical after a full BMC reboot on a
+    /// non-latching mux), restore the last requested persistency mask.
+    async fn initialize_power(&self) -> anyhow::Result<()> {
+        match self.power_controller.read_power_mask().await {
+            Ok(0) => {
+                let persisted = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
+                if persisted != 0 {
+                    info!(
+                        "power sysfs reports all nodes off; restoring persistency {:#06b}",
+                        persisted
+                    );
+                    self.activate_slot(persisted, 0b1111).await?;
+                }
+            }
+            Ok(hw) => {
+                info!("syncing persistency from hardware power mask {:#06b}", hw);
+                self.app_db.try_set(ACTIVATED_NODES_KEY, hw).await?;
+                self.power_controller
+                    .power_led(hw != 0)
+                    .await
+                    .unwrap_or_else(|e| tracing::warn!("power LED error: {:#}", e));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "cannot read power sysfs ({:#}); restoring persistency",
+                    e
+                );
+                let power_state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
+                self.activate_slot(power_state, 0b1111).await?;
+            }
+        }
+        Ok(())
     }
 
     #[instrument(skip(self), fields(alternative_port, config))]
     async fn initialize_usb_mode(&self) -> anyhow::Result<()> {
         if self.pin_controller.usb_bus_type() == UsbArchitecture::UsbHub {
-            let alternative_port = self.app_db.get::<bool>(NODE1_USB_MODE).await;
+            let alternative_port = self.app_db.try_get::<bool>(NODE1_USB_MODE).await?;
             self.pin_controller.set_node1_usb_route(alternative_port)?;
             tracing::Span::current().record("alternative_port", alternative_port);
         }
 
-        let config = self.app_db.get::<UsbConfig>(USB_CONFIG).await;
+        let config = self.app_db.try_get::<UsbConfig>(USB_CONFIG).await?;
         tracing::Span::current().record("config", format!("{:?}", config));
         self.configure_usb(config).await.context("USB configure")
     }
 
     async fn initialize_cooling(&self) -> anyhow::Result<()> {
-        let store = self.app_db.get::<CoolingMap>(COOLING_DEVICES).await;
+        let store = self.app_db.try_get::<CoolingMap>(COOLING_DEVICES).await?;
         let devices = get_cooling_state().await;
 
         info!(
@@ -190,24 +225,36 @@ impl BmcApplication {
         }
 
         // cleanup storage
-        let map: CoolingMap = HashMap::from_iter(set_devices.into_iter());
+        let map: CoolingMap = HashMap::from_iter(set_devices);
         info!("loaded cooling devices: {:?}", map);
-        self.app_db.set(COOLING_DEVICES, map).await;
+        self.app_db.try_set(COOLING_DEVICES, map).await?;
 
         Ok(())
     }
 
-    pub async fn get_usb_mode(&self) -> (UsbConfig, String) {
-        (
-            self.app_db.get::<UsbConfig>(USB_CONFIG).await,
+    pub async fn get_usb_mode(&self) -> anyhow::Result<(UsbConfig, String)> {
+        Ok((
+            self.app_db.try_get::<UsbConfig>(USB_CONFIG).await?,
             self.pin_controller.usb_bus_type().to_string(),
-        )
+        ))
     }
 
-    /// routine to support legacy API
+    /// Prefer live sysfs; persistency is only a fallback.
     pub async fn get_node_power(&self, node: NodeId) -> anyhow::Result<bool> {
+        if let Ok(mask) = self.power_controller.read_power_mask().await {
+            return Ok(mask & node.to_bitfield() != 0);
+        }
         let state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
         Ok(state & node.to_bitfield() != 0)
+    }
+
+    pub async fn uart_bauds(&self) -> [u32; 4] {
+        let infos = self
+            .app_db
+            .try_get::<NodeInfos>(NODE_INFO_KEY)
+            .await
+            .unwrap_or_default();
+        std::array::from_fn(|i| infos[i].uart_baud.unwrap_or(115_200))
     }
 
     /// This function is used to active a given node. Call this function if a
@@ -221,12 +268,14 @@ impl BmcApplication {
         );
         ensure!(mask != 0);
 
-        let state = self.app_db.get::<u8>(ACTIVATED_NODES_KEY).await;
+        let state = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
         let new_state = (state & !mask) | (node_states & mask);
 
         self.update_power_on_times(state, node_states, mask).await;
 
-        self.app_db.set::<u8>(ACTIVATED_NODES_KEY, new_state).await;
+        self.app_db
+            .try_set::<u8>(ACTIVATED_NODES_KEY, new_state)
+            .await?;
         debug!("node activated bits updated:{:#06b}.", new_state);
 
         let led = new_state != 0;
@@ -264,24 +313,25 @@ impl BmcApplication {
         }
 
         self.app_db
-            .set::<NodeInfos>(NODE_INFO_KEY, node_infos)
-            .await;
+            .try_set::<NodeInfos>(NODE_INFO_KEY, node_infos)
+            .await
+            .unwrap_or_else(|e| tracing::warn!("node info persist: {:#}", e));
     }
 
     pub async fn set_node1_usb_route(&self, alternative_port: bool) -> anyhow::Result<()> {
         info!("changed node1 usb route. port= {}", alternative_port);
         self.pin_controller.set_node1_usb_route(alternative_port)?;
-        self.app_db.set(NODE1_USB_MODE, alternative_port).await;
+        self.app_db.try_set(NODE1_USB_MODE, alternative_port).await?;
         Ok(())
     }
 
-    pub async fn get_node1_usb_route(&self) -> bool {
-        self.app_db.get::<bool>(NODE1_USB_MODE).await
+    pub async fn get_node1_usb_route(&self) -> anyhow::Result<bool> {
+        Ok(self.app_db.try_get::<bool>(NODE1_USB_MODE).await?)
     }
 
     pub async fn configure_usb(&self, config: UsbConfig) -> anyhow::Result<()> {
         self.configure_usb_internal(config).await?;
-        self.app_db.set(USB_CONFIG, config).await;
+        self.app_db.try_set(USB_CONFIG, config).await?;
         Ok(())
     }
 
@@ -320,14 +370,13 @@ impl BmcApplication {
         tokio::spawn(async {
             sleep(Duration::from_secs(1)).await;
             info!("restarting br0 ethernet adapter");
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg("ifdown br0 && ifup br0")
-                .status()
-                .unwrap();
-
-            if !status.success() {
-                tracing::error!("reset of network interface returned: {}", status);
+            let down = Command::new("ifdown").arg("br0").status();
+            let up = Command::new("ifup").arg("br0").status();
+            match (down, up) {
+                (Ok(d), Ok(u)) if d.success() && u.success() => {}
+                (down, up) => {
+                    tracing::error!("reset of network interface returned: {:?} / {:?}", down, up);
+                }
             }
         });
 
@@ -404,7 +453,7 @@ impl BmcApplication {
 
     #[instrument(skip(self))]
     pub async fn set_node_info(&self, new_info: HashMap<NodeId, NodeInfo>) -> anyhow::Result<()> {
-        let mut stored_nodes = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        let mut stored_nodes = self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await?;
 
         for (i, info) in &mut new_info.into_iter().map(|(k, v)| (k as usize, v)) {
             let store_node = &mut stored_nodes[i];
@@ -423,8 +472,8 @@ impl BmcApplication {
         }
 
         self.app_db
-            .set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
-            .await;
+            .try_set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
+            .await?;
 
         Ok(())
     }
@@ -435,7 +484,7 @@ impl BmcApplication {
             anyhow::bail!("Current time before Unix epoch");
         };
 
-        let mut node_infos = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
+        let mut node_infos = self.app_db.try_get::<NodeInfos>(NODE_INFO_KEY).await?;
         node_infos.iter_mut().for_each(|info| {
             if let Some(time) = &mut info.power_on_time {
                 *time = current_time - *time;
@@ -449,13 +498,13 @@ impl BmcApplication {
         let res = set_cooling_state(device, &speed).await;
 
         if res.is_ok() {
-            let mut cooling = self.app_db.get::<CoolingMap>(COOLING_DEVICES).await;
+            let mut cooling = self.app_db.try_get::<CoolingMap>(COOLING_DEVICES).await?;
             if cooling.len() < COOLING_CAPACITY {
                 let mut hasher = DefaultHasher::new();
                 device.hash(&mut hasher);
                 let value = cooling.entry(hasher.finish()).or_default();
                 *value = speed;
-                self.app_db.set(COOLING_DEVICES, cooling).await;
+                self.app_db.try_set(COOLING_DEVICES, cooling).await?;
             } else {
                 tracing::warn!(
                     "cooling devices persistency full, no room to persist speed of '{}'",

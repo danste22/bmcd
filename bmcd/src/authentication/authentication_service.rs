@@ -38,6 +38,7 @@ pub struct AuthenticationService<S> {
     context: Arc<Mutex<AuthenticationContext<UnixValidator>>>,
     authentication_path: &'static str,
     realm: &'static str,
+    allow_loopback_bypass: bool,
 }
 
 impl<S> AuthenticationService<S> {
@@ -46,12 +47,14 @@ impl<S> AuthenticationService<S> {
         context: Arc<Mutex<AuthenticationContext<UnixValidator>>>,
         authentication_path: &'static str,
         realm: &'static str,
+        allow_loopback_bypass: bool,
     ) -> Self {
         AuthenticationService {
             service,
             context,
             authentication_path,
             realm,
+            allow_loopback_bypass,
         }
     }
 }
@@ -72,10 +75,11 @@ where
         let service = self.service.clone();
 
         // drop authentication for requests on loopback interface
-        if request
-            .head()
-            .peer_addr
-            .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+        if self.allow_loopback_bypass
+            && request
+                .head()
+                .peer_addr
+                .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
         {
             return Box::pin(async move {
                 service
@@ -90,15 +94,11 @@ where
         let realm = self.realm;
 
         Box::pin(async move {
-            let peer = request
-                .connection_info()
-                .peer_addr()
-                .unwrap_or_default()
-                .to_string();
-            let mut context = context.lock().await;
+            let peer = peer_key(&request);
 
             // handle authentication requests and return
             if request.request().uri().path() == auth_path {
+                let mut context = context.lock().await;
                 return authentication_request(&mut request, &peer, &mut context).await;
             }
 
@@ -109,7 +109,12 @@ where
                 }
             };
 
-            if let Err(e) = context.authorize_request(&peer, auth).await {
+            let authorized = {
+                let mut context = context.lock().await;
+                context.authorize_request(&peer, auth).await
+            };
+
+            if let Err(e) = authorized {
                 unauthorized_response(request.request(), e, realm)
             } else {
                 service
@@ -119,6 +124,20 @@ where
             }
         })
     }
+}
+
+fn peer_key(request: &ServiceRequest) -> String {
+    request
+        .head()
+        .peer_addr
+        .map(|addr| addr.ip().to_canonical().to_string())
+        .or_else(|| {
+            request
+                .connection_info()
+                .realip_remote_addr()
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unknown-peer".to_string())
 }
 
 async fn authentication_request<B>(

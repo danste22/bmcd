@@ -40,12 +40,18 @@ pub struct Store {
     pub write_timeout: Option<Duration>,
 }
 
+fn default_loopback_bypass() -> bool {
+    true
+}
+
 #[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct Authentication {
     pub authentication_attempts: usize,
     #[serde_as(as = "DurationSeconds<u64>")]
     pub token_expires: Duration,
+    #[serde(default = "default_loopback_bypass")]
+    pub allow_loopback_bypass: bool,
 }
 
 #[derive(Debug, Deserialize)]

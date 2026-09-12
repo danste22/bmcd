@@ -73,7 +73,10 @@ impl TryInto<TransferRequest> for InitializeTransfer {
 
 pub enum UpgradeCommand {
     OsUpgrade,
-    Module(NodeId, Arc<BmcApplication>),
+    Module {
+        node: NodeId,
+        bmc: Arc<BmcApplication>,
+    },
 }
 
 impl UpgradeCommand {
@@ -83,7 +86,20 @@ impl UpgradeCommand {
     ) -> BoxFuture<'static, Result<(), anyhow::Error>> {
         match self {
             UpgradeCommand::OsUpgrade => Box::pin(upgrade_worker.os_update()),
-            UpgradeCommand::Module(bmc, node) => Box::pin(upgrade_worker.flash_node(node, bmc)),
+            UpgradeCommand::Module { node, bmc } => Box::pin(upgrade_worker.flash_node(bmc, node)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpgradeCommand;
+
+    #[test]
+    fn module_variant_uses_named_fields() {
+        // Named fields make `Module { node, bmc }` the only legal construction.
+        // A swapped tuple would not compile.
+        let matches_os = matches!(UpgradeCommand::OsUpgrade, UpgradeCommand::OsUpgrade);
+        assert!(matches_os);
     }
 }

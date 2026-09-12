@@ -19,7 +19,7 @@ use tracing::warn;
 pub struct PowerController;
 
 impl PowerController {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(_is_latching_system: bool) -> anyhow::Result<Self> {
         Ok(PowerController)
     }
 
@@ -39,8 +39,18 @@ impl PowerController {
         Ok(())
     }
 
-    pub async fn power_led(&self, on: bool) -> std::io::Result<()> {
+    pub async fn power_led(&self, on: bool) -> anyhow::Result<()> {
+        let _ = on;
         Ok(())
+    }
+
+    pub async fn status_led(&self, on: bool) -> anyhow::Result<()> {
+        let _ = on;
+        Ok(())
+    }
+
+    pub async fn read_power_mask(&self) -> anyhow::Result<u8> {
+        Ok(0)
     }
 }
 

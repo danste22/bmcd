@@ -31,17 +31,26 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 pub struct StreamingDataService {
     status: Arc<Mutex<StreamingState>>,
+    timeout_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl StreamingDataService {
     pub fn new() -> Self {
         Self {
             status: Arc::new(Mutex::new(StreamingState::Ready)),
+            timeout_task: Mutex::new(None),
+        }
+    }
+
+    async fn abort_timeout(&self) {
+        if let Some(handle) = self.timeout_task.lock().await.take() {
+            handle.abort();
         }
     }
 
@@ -53,6 +62,18 @@ impl StreamingDataService {
         &self,
         request: TransferRequest,
     ) -> Result<u32, StreamingServiceError> {
+        {
+            let status = self.status.lock().await;
+            if matches!(*status, StreamingState::Transferring(_)) {
+                return Err(StreamingServiceError::WrongState(
+                    status.to_string(),
+                    "Ready, Done, or Error".to_string(),
+                ));
+            }
+        }
+
+        self.abort_timeout().await;
+
         let mut rng = rand::rng();
         let id = rng.random();
 
@@ -73,17 +94,19 @@ impl StreamingDataService {
         );
 
         self.execute_worker(&context, request.worker).await;
-        Self::cancel_request_on_timeout(self.status.clone());
+        let timeout = Self::cancel_request_on_timeout(self.status.clone());
+        *self.timeout_task.lock().await = Some(timeout);
         *self.status.lock().await = StreamingState::Transferring(context);
 
         Ok(id)
     }
 
     pub async fn cancel_all(&self) {
+        self.abort_timeout().await;
         *self.status.lock().await = StreamingState::Error("cancelled by user".to_string());
     }
 
-    fn cancel_request_on_timeout(status: Arc<Mutex<StreamingState>>) {
+    fn cancel_request_on_timeout(status: Arc<Mutex<StreamingState>>) -> JoinHandle<()> {
         tokio::spawn(async move {
             sleep(Duration::from_secs(10)).await;
             let mut status_unlocked = status.lock().await;
@@ -94,7 +117,7 @@ impl StreamingDataService {
                     *status_unlocked = StreamingState::Error("Send timeout".to_string());
                 }
             }
-        });
+        })
     }
 
     /// Worker task that performs the actual node flash. This tasks finishes if
@@ -159,6 +182,13 @@ impl StreamingDataService {
         });
     }
 
+    pub fn flash_status_code(state: &StreamingState) -> StatusCode {
+        match state {
+            StreamingState::Error(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::OK,
+        }
+    }
+
     /// Write a chunk of bytes to the module that is selected for flashing.
     ///
     /// # Return
@@ -166,9 +196,9 @@ impl StreamingDataService {
     /// This function returns:
     ///
     /// * 'Err(StreamingServiceError::WrongState)' if this function is called when
-    ///     ['StreamingDataService'] is not in 'Transferring' state.
+    ///   ['StreamingDataService'] is not in 'Transferring' state.
     /// * 'Err(StreamingServiceError::HandlesDoNotMatch)', the passed id is
-    ///     unknown
+    ///   unknown
     /// * 'Err(StreamingServiceError::SenderTaken(_)'
     /// * Ok(()) on success
     pub async fn take_sender(
@@ -191,8 +221,11 @@ impl StreamingDataService {
             .data_sender
             .take()
             .ok_or(StreamingServiceError::SenderTaken)?;
+        let size = context.size;
+        drop(status);
+        self.abort_timeout().await;
 
-        Ok((sender, context.size))
+        Ok((sender, size))
     }
 
     /// Return a borrow to the current status of the flash service
@@ -272,6 +305,23 @@ impl Display for StreamingState {
             StreamingState::Done(_, _) => f.write_str("Done"),
             StreamingState::Error(_) => f.write_str("Error"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flash_status_code_maps_error() {
+        assert_eq!(
+            StreamingDataService::flash_status_code(&StreamingState::Ready),
+            StatusCode::OK
+        );
+        assert_eq!(
+            StreamingDataService::flash_status_code(&StreamingState::Error("boom".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 

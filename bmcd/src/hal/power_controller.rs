@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::{
-    helpers::{bit_iterator, load_lines},
+    helpers::{bit_iterator, load_lines, parse_node_power_state},
     NodeId,
 };
 use crate::gpio_output_array;
@@ -80,15 +80,15 @@ impl PowerController {
     ///
     /// # Arguments
     ///
-    /// * `node_states`     bit-field representing the nodes on the turing-pi board,
-    ///     where bit 1 is on and 0 equals off.
+    /// * `node_states` bit-field representing the nodes on the turing-pi board,
+    ///   where bit 1 is on and 0 equals off.
     /// * `node_mask`       bit-field to describe which nodes to control.
     ///
     /// # Returns
     ///
     /// * `Ok(())` when routine was executed successfully.
     /// * `Err(io error)` in the case there was a failure to write to the Linux
-    ///     subsystem that handles the node powering.
+    ///   subsystem that handles the node powering.
     pub async fn set_power_node(&self, node_states: u8, node_mask: u8) -> anyhow::Result<()> {
         let updates = bit_iterator(node_states, node_mask);
 
@@ -124,6 +124,25 @@ impl PowerController {
             .await
             .context(STATUS_LED)
     }
+
+    /// Read the current node power mask from sysfs. Bit 0 is node 1.
+    pub async fn read_power_mask(&self) -> anyhow::Result<u8> {
+        read_sysfs_power_mask().await
+    }
+}
+
+pub async fn read_sysfs_power_mask() -> anyhow::Result<u8> {
+    let mut mask = 0u8;
+    for node_id in 1..=4 {
+        let sys_path = format!("/sys/bus/platform/devices/node{}-power/state", node_id);
+        let value = tokio::fs::read_to_string(&sys_path)
+            .await
+            .with_context(|| sys_path.clone())?;
+        if parse_node_power_state(&value).unwrap_or(false) {
+            mask |= 1 << (node_id - 1);
+        }
+    }
+    Ok(mask)
 }
 
 async fn set_mode(node_id: usize, node_state: u8) -> std::io::Result<()> {

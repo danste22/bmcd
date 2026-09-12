@@ -26,6 +26,7 @@ use crate::serial_service::serial::SerialConnections;
 use crate::serial_service::{legacy_serial_get_handler, legacy_serial_set_handler};
 use crate::streaming_data_service::data_transfer::DataTransfer;
 use crate::streaming_data_service::StreamingDataService;
+use crate::utils::transfer_source::{validate_download_url, validate_local_transfer_path};
 use actix_files::file_extension_to_mime;
 use actix_multipart::Multipart;
 use actix_web::guard::{fn_guard, GuardContext};
@@ -35,22 +36,53 @@ use anyhow::Context;
 use async_compression::tokio::bufread::GzipEncoder;
 use async_compression::Level;
 use board_info::{self, BoardInfoAttribute};
+use bytes::Bytes;
 use humansize::{format_size, DECIMAL};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::c_ulong;
-use std::io;
+use std::io::{self, Write};
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 use super::get_node_param;
 type Query = web::Query<std::collections::HashMap<String, String>>;
+
+const MAX_UPLOAD_CHUNK: usize = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct TransferQuery {
+    #[serde(rename = "type")]
+    ty: Option<String>,
+    file: Option<String>,
+    local: Option<String>,
+    sha256: Option<String>,
+    length: Option<String>,
+    skip_crc: Option<String>,
+    node: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsbSetQuery {
+    node: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PowerSetQuery {
+    node1: Option<String>,
+    node2: Option<String>,
+    node3: Option<String>,
+    node4: Option<String>,
+}
 
 /// version 1:
 ///
@@ -105,6 +137,11 @@ fn flash_guard(context: &GuardContext<'_>) -> bool {
     query.contains("opt=set") && (query.contains("type=flash") || query.contains("type=firmware"))
 }
 
+fn parse_query_map<T: serde::de::DeserializeOwned>(query: &Query) -> LegacyResult<T> {
+    serde_json::from_value(serde_json::to_value(&**query)?)
+        .map_err(|e| LegacyResponse::bad_request(e.to_string()))
+}
+
 fn set_node_info_guard(context: &GuardContext<'_>) -> bool {
     let Some(query) = context.head().uri.query() else {
         return false;
@@ -114,32 +151,48 @@ fn set_node_info_guard(context: &GuardContext<'_>) -> bool {
 
 #[get("/backup")]
 async fn backup_handler() -> impl Responder {
-    let archive = tokio::task::spawn_blocking(move || {
-        let mut builder = tar::Builder::new(Vec::new());
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(8);
+
+    tokio::task::spawn_blocking(move || {
+        struct ChannelWriter {
+            tx: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
+        }
+
+        impl Write for ChannelWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(buf)))
+                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer = ChannelWriter { tx: tx.clone() };
+        let mut builder = tar::Builder::new(writer);
         builder.mode(tar::HeaderMode::Deterministic);
-        builder
+        if let Err(e) = builder
             .append_dir_all(".", "/mnt/overlay/upper/")
             .and_then(|_| builder.finish())
-            .and_then(|_| builder.into_inner())
-    })
-    .await
-    .expect("error joining archiving task");
-
-    match archive {
-        Ok(buffer) => {
-            let now = chrono::Local::now();
-            let content_disposition = format!(
-                r#"attachment; filename="tp2-backup-{}.tar.gz""#,
-                now.format("%d-%m-%Y")
-            );
-            let encoder = GzipEncoder::with_quality(std::io::Cursor::new(buffer), Level::Best);
-            HttpResponse::Ok()
-                .insert_header(header::ContentType(file_extension_to_mime("gz")))
-                .insert_header((header::CONTENT_DISPOSITION, content_disposition))
-                .streaming(ReaderStream::new(encoder))
+        {
+            let _ = tx.blocking_send(Err(e));
         }
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-    }
+    });
+
+    let now = chrono::Local::now();
+    let content_disposition = format!(
+        r#"attachment; filename="tp2-backup-{}.tar.gz""#,
+        now.format("%d-%m-%Y")
+    );
+    let reader = StreamReader::new(ReceiverStream::new(rx));
+    let encoder = GzipEncoder::with_quality(reader, Level::Best);
+    HttpResponse::Ok()
+        .insert_header(header::ContentType(file_extension_to_mime("gz")))
+        .insert_header((header::CONTENT_DISPOSITION, content_disposition))
+        .streaming(ReaderStream::new(encoder))
 }
 
 #[get("/info")]
@@ -168,7 +221,7 @@ async fn api_entry(
         ("clear_usb_boot", true) => clear_usb_boot(bmc).into(),
         ("network", true) => reset_network(bmc).await.into(),
         ("nodeinfo", true) => set_node_info().into(),
-        ("nodeinfo", false) => get_node_info(bmc).into(),
+        ("nodeinfo", false) => get_node_info(bmc).await.into(),
         ("node_info", false) => get_node_aux_info(bmc).await.into(),
         ("node_to_msd", true) => set_node_to_msd(bmc, query).await.into(),
         ("other", false) => get_system_information().await.into(),
@@ -184,7 +237,7 @@ async fn api_entry(
         ("usb", true) => set_usb_mode(bmc, query).await.into(),
         ("usb", false) => get_usb_mode(bmc).await.into(),
         ("usb_node1", true) => set_node1_usb_mode(bmc, query).await.into(),
-        ("usb_node1", false) => get_node1_usb_mode(bmc).await,
+        ("usb_node1", false) => get_node1_usb_mode(bmc).await.into(),
         ("info", false) => get_info().await.into(),
         ("cooling", false) => get_cooling_info().await.into(),
         ("cooling", true) => set_cooling_info(bmc, query).await.into(),
@@ -200,10 +253,11 @@ async fn api_entry(
 #[allow(clippy::unused_unit)]
 fn reload_self() -> impl Into<LegacyResponse> {
     tokio::task::spawn_blocking(move || {
-        Command::new("sh")
-            .arg("-c")
-            .arg("/etc/init.d/S94bmcd restart")
-            .status()
+        match Command::new("/etc/init.d/S94bmcd").arg("restart").status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::error!("bmcd restart returned {status}"),
+            Err(e) => tracing::error!("bmcd restart failed: {e}"),
+        }
     });
 
     ()
@@ -282,24 +336,32 @@ fn set_node_info() -> impl Into<LegacyResponse> {
     LegacyResponse::not_implemented("Method type `set` on parameter `nodeinfo` is deprecated")
 }
 
-fn get_node_info(_bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    // TODO: implement serial listening in BmcApplication
-    let (n1, n2, n3, n4) = (0, 0, 0, 0);
-
-    json! {
-       [{
-            "node1": n1,
-            "node2": n2,
-            "node3": n3,
-            "node4": n4,
-       }]
+async fn get_node_info(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
+    match bmc.get_node_infos().await {
+        Ok(infos) => json! {
+           [{
+                "node1": infos[0],
+                "node2": infos[1],
+                "node3": infos[2],
+                "node4": infos[3],
+           }]
+        }
+        .into(),
+        Err(e) => LegacyResponse::from(e),
     }
 }
 async fn set_node_aux_info(
     bmc: web::Data<BmcApplication>,
+    serial: web::Data<SerialConnections>,
     payload: web::Json<HashMap<NodeId, NodeInfo>>,
 ) -> impl Responder {
-    bmc.set_node_info(payload.into_inner()).await?;
+    let updates = payload.into_inner();
+    for (node, info) in &updates {
+        if let Some(baud) = info.uart_baud {
+            serial.set_baud_rate(*node, baud).await?;
+        }
+    }
+    bmc.set_node_info(updates).await?;
     Ok::<Null, LegacyResponse>(Null)
 }
 
@@ -378,12 +440,23 @@ async fn get_system_information() -> impl Into<LegacyResponse> {
 }
 
 async fn set_node_power(bmc: &BmcApplication, query: Query) -> LegacyResponse {
+    let parsed: PowerSetQuery = match parse_query_map(&query) {
+        Ok(q) => q,
+        Err(e) => return e,
+    };
+
+    let nodes = [
+        ("node1", parsed.node1),
+        ("node2", parsed.node2),
+        ("node3", parsed.node3),
+        ("node4", parsed.node4),
+    ];
+
     let mut mask = 0;
     let mut states = 0;
 
-    for idx in 0..4 {
-        let param = format!("node{}", idx + 1);
-        let req_status = match query.get(&param).map(String::as_str) {
+    for (idx, (param, value)) in nodes.into_iter().enumerate() {
+        let req_status = match value.as_deref() {
             Some("0") => false,
             Some("1") => true,
             Some(x) => {
@@ -449,9 +522,9 @@ fn get_sdcard_info() -> LegacyResponse {
             )
             .into()
         }
-        Err(_) => (
+        Err(e) => (
             StatusCode::BAD_REQUEST,
-            "Failed to get microSD card info: {}",
+            format!("Failed to get microSD card info: {e}"),
         )
             .into(),
     }
@@ -463,8 +536,8 @@ async fn set_node1_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<
         .map_err(Into::into)
 }
 
-async fn get_node1_usb_mode(bmc: &BmcApplication) -> LegacyResponse {
-    LegacyResponse::ok(bmc.get_node1_usb_route().await.into())
+async fn get_node1_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
+    Ok(bmc.get_node1_usb_route().await?.into())
 }
 
 /// switches the USB configuration.
@@ -482,12 +555,11 @@ async fn get_node1_usb_mode(bmc: &BmcApplication) -> LegacyResponse {
 /// | 7   | Flash device | BMC   |
 ///
 async fn set_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
-    let node = get_node_param(&query)?;
-    let mode_str = query
-        .get("mode")
-        .ok_or(LegacyResponse::bad_request("Missing `mode` parameter"))?;
-
-    let mode_num = i32::from_str(mode_str)
+    let parsed: UsbSetQuery = parse_query_map(&query)?;
+    let node_num = i32::from_str(&parsed.node)
+        .map_err(|_| LegacyResponse::bad_request("Parameter `node` is not a number"))?;
+    let node = NodeId::try_from(node_num).map_err(LegacyResponse::bad_request)?;
+    let mode_num = i32::from_str(&parsed.mode)
         .map_err(|_| LegacyResponse::bad_request("Parameter `mode` is not a number"))?;
 
     let mode = UsbMode::from_api_mode(mode_num);
@@ -512,8 +584,8 @@ async fn set_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
 }
 
 /// gets the USB configuration from the POV of the configured node.
-async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    let (config, bus_type) = bmc.get_usb_mode().await;
+async fn get_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
+    let (config, bus_type) = bmc.get_usb_mode().await?;
 
     let (node, mode, route) = match config {
         UsbConfig::UsbA(node) => (node, UsbMode::Device, UsbRoute::AlternativePort),
@@ -522,14 +594,14 @@ async fn get_usb_mode(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
         UsbConfig::Flashing(node, route) => (node, UsbMode::Flash, route),
     };
 
-    json!(
+    Ok(json!(
         [{
             "mode": mode,
-            "node": node.to_string(),
+            "node": node.api_name(),
             "route": route,
             "bus_type": bus_type,
         }]
-    )
+    ))
 }
 
 async fn set_cooling_info(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
@@ -556,25 +628,35 @@ async fn get_cooling_info() -> LegacyResult<serde_json::Value> {
     Ok(json!(info))
 }
 
-async fn handle_flash_status(flash: web::Data<StreamingDataService>) -> LegacyResult<String> {
-    Ok(serde_json::to_string(flash.status().await.deref())?)
+async fn handle_flash_status(flash: web::Data<StreamingDataService>) -> HttpResponse {
+    let status = flash.status().await;
+    let code = StreamingDataService::flash_status_code(&status);
+    match serde_json::to_string(status.deref()) {
+        Ok(body) => HttpResponse::build(code)
+            .content_type("application/json")
+            .body(body),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }
 
 async fn handle_transfer_request(
     ss: web::Data<StreamingDataService>,
     bmc: web::Data<BmcApplication>,
-    query: Query,
+    query: web::Query<TransferQuery>,
 ) -> LegacyResult<String> {
-    let (process_name, upgrade_command) = match query.get("type").map(|c| c.as_str()) {
+    let (process_name, upgrade_command) = match query.ty.as_deref() {
         Some("firmware") => (
             "firmware upgrade service".to_string(),
             UpgradeCommand::OsUpgrade,
         ),
         Some("flash") => {
-            let node = get_node_param(&query)?;
+            let node = parse_node_id(query.node.as_deref())?;
             (
                 format!("{node} os install service"),
-                UpgradeCommand::Module(node, bmc.clone().into_inner()),
+                UpgradeCommand::Module {
+                    node,
+                    bmc: bmc.clone().into_inner(),
+                },
             )
         }
         _ => {
@@ -585,7 +667,7 @@ async fn handle_transfer_request(
     };
 
     let data_transfer = create_data_transfer(&query).await?;
-    let do_crc = !query.contains_key("skip_crc");
+    let do_crc = query.skip_crc.is_none();
     let transfer_request =
         InitializeTransfer::new(process_name, upgrade_command, data_transfer, do_crc);
 
@@ -594,28 +676,39 @@ async fn handle_transfer_request(
     Ok(json.to_string())
 }
 
-async fn create_data_transfer(query: &Query) -> LegacyResult<DataTransfer> {
-    let file = query.get("file").ok_or(LegacyResponse::bad_request(
-        "Invalid `file` query parameter",
-    ))?;
+fn parse_node_id(node: Option<&str>) -> LegacyResult<NodeId> {
+    let node_str = node.ok_or(LegacyResponse::bad_request("Missing `node` parameter"))?;
+    let node_num = i32::from_str(node_str)
+        .map_err(|_| LegacyResponse::bad_request("Parameter `node` is not a number"))?;
+    NodeId::try_from(node_num).map_err(LegacyResponse::bad_request)
+}
 
-    if query.contains_key("local") {
-        return Ok(DataTransfer::local(PathBuf::from(file)));
+async fn create_data_transfer(query: &TransferQuery) -> LegacyResult<DataTransfer> {
+    let file = query
+        .file
+        .as_deref()
+        .ok_or(LegacyResponse::bad_request("Invalid `file` query parameter"))?;
+
+    if query.local.is_some() {
+        let path = validate_local_transfer_path(Path::new(file))
+            .map_err(|e| LegacyResponse::bad_request(e.to_string()))?;
+        return Ok(DataTransfer::local(path));
     }
 
-    let sha256 = try_map_sha256(query.get("sha256"))?;
+    let sha256 = try_map_sha256(query.sha256.as_ref())?;
 
-    if file.starts_with("http") {
+    if file.starts_with("http://") || file.starts_with("https://") {
         let url = reqwest::Url::parse(file).map_err(|e| {
             LegacyResponse::bad_request(format!(
                 "{file} could not be parsed to a url object: {:#}",
                 e
             ))
         })?;
+        validate_download_url(&url).map_err(|e| LegacyResponse::bad_request(e.to_string()))?;
         return Ok(DataTransfer::url(url, sha256).await?);
     }
 
-    let size = query.get("length").ok_or((
+    let size = query.length.as_ref().ok_or((
         StatusCode::LENGTH_REQUIRED,
         "Invalid `length` query parameter",
     ))?;
@@ -623,7 +716,7 @@ async fn create_data_transfer(query: &Query) -> LegacyResult<DataTransfer> {
     let size = u64::from_str(size)
         .map_err(|_| LegacyResponse::bad_request("`length` parameter is not a number"))?;
 
-    Ok(DataTransfer::remote(PathBuf::from(&file), size, 16, sha256))
+    Ok(DataTransfer::remote(PathBuf::from(file), size, 16, sha256))
 }
 
 pub fn try_map_sha256(value: Option<&String>) -> LegacyResult<Option<bytes::Bytes>> {
@@ -664,6 +757,13 @@ async fn handle_file_upload(
     let mut bytes_send: u64 = 0;
     while let Some(Ok(chunk)) = field.next().await {
         let length = chunk.len();
+        if length > MAX_UPLOAD_CHUNK {
+            ss.cancel_all().await;
+            return Err(LegacyResponse::bad_request(format!(
+                "upload chunk exceeds {}",
+                format_size(MAX_UPLOAD_CHUNK as u64, DECIMAL)
+            )));
+        }
         if sender.send(chunk).await.is_err() {
             return Err(return_transfer_error(ss).await.into());
         }

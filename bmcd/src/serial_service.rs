@@ -36,7 +36,7 @@ pub fn serial_config(cfg: &mut web::ServiceConfig) {
 
 #[post("/serial/status")]
 async fn serial_status(serials: web::Data<SerialConnections>) -> impl Responder {
-    serde_json::to_string(&serials.get_state()).unwrap_or_else(|e| e.to_string())
+    serde_json::to_string(&serials.get_state().await).unwrap_or_else(|e| e.to_string())
 }
 
 pub async fn legacy_serial_set_handler(
@@ -52,7 +52,12 @@ pub async fn legacy_serial_set_handler(
     let mut data: BytesMut = cmd.as_str().into();
     data.extend_from_slice(b"\r\n");
 
-    serials[node].write(data.into()).await.map_err(Into::into)
+    serials
+        .handler(node)
+        .await
+        .write(data.into())
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn legacy_serial_get_handler(
@@ -61,7 +66,11 @@ pub async fn legacy_serial_get_handler(
 ) -> LegacyResult<LegacyResponse> {
     let node = get_node_param(&query)?;
     let encoding = get_encoding_param(&query)?;
-    let data = serials[node].read_as_string(encoding).await?;
+    let data = serials
+        .handler(node)
+        .await
+        .read_as_string(encoding)
+        .await?;
 
     Ok(LegacyResponse::UartData(data))
 }
@@ -102,7 +111,7 @@ async fn handle_ws(
 ) -> Result<HttpResponse, actix_web::Error> {
     let node = get_node_param(&query)?;
     let (res, session, msg_stream) = actix_ws::handle(&req, stream)?;
-    match serials[node].open_channel() {
+    match serials.handler(node).await.open_channel() {
         Ok((stream, sink)) => {
             run_websocket(session, msg_stream, stream, sink).await;
             Ok(res)

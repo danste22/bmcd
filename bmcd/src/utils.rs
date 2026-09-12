@@ -11,12 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#[cfg(target_os = "linux")]
 mod event_listener;
 mod io;
+pub mod transfer_source;
 
 use anyhow::bail;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
 #[doc(inline)]
 pub use event_listener::*;
 pub use io::*;
@@ -24,15 +27,12 @@ use std::{path::PathBuf, process::Output};
 use tokio::io::AsyncBufReadExt;
 
 pub fn string_from_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let u16s = bytes.chunks_exact(2).map(|pair| {
-        let Ok(owned) = pair.try_into() else {
-            unreachable!()
-        };
-
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    let u16s = chunks.iter().map(|pair| {
         if little_endian {
-            u16::from_le_bytes(owned)
+            u16::from_le_bytes(*pair)
         } else {
-            u16::from_be_bytes(owned)
+            u16::from_be_bytes(*pair)
         }
     });
 
@@ -40,7 +40,7 @@ pub fn string_from_utf16(bytes: &[u8], little_endian: bool) -> String {
         .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect::<String>();
 
-    if bytes.len() % 2 == 1 {
+    if !remainder.is_empty() {
         string.push(char::REPLACEMENT_CHARACTER)
     }
 

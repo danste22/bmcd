@@ -168,6 +168,7 @@ impl<'a> PersistencyStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn get<T>(&self, key: &str) -> T
     where
         for<'b> T: serde::Deserialize<'b>,
@@ -190,6 +191,7 @@ impl<'a> PersistencyStore {
             })
     }
 
+    #[allow(dead_code)]
     pub async fn set<T>(&self, key: &str, value: T)
     where
         T: serde::Serialize,

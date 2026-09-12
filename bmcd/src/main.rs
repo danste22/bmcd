@@ -62,8 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let _logger_lifetime = init_logger(&config.log);
 
     let tls = load_tls_config(&config)?;
-    let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
-    let serial_service = Data::new(SerialConnections::new());
+    let bmc_app = BmcApplication::new(config.store.write_timeout).await?;
+    let serial_service = Data::new(SerialConnections::new(bmc_app.uart_bauds().await));
+    let bmc = Data::new(bmc_app);
     let streaming_data_service = Data::new(StreamingDataService::new());
     let authentication = Arc::new(
         LinuxAuthenticator::new(
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             "Access to Baseboard Management Controller",
             config.authentication.token_expires,
             config.authentication.authentication_attempts,
+            config.authentication.allow_loopback_bypass,
         )
         .await?,
     );

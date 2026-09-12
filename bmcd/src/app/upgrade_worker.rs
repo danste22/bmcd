@@ -15,6 +15,7 @@ use crate::app::bmc_application::BmcApplication;
 use crate::hal::{NodeId, UsbRoute};
 use crate::streaming_data_service::data_transfer::DataTransfer;
 use crate::utils::WriteMonitor;
+use crate::utils::transfer_source::sanitize_upgrade_filename;
 use anyhow::bail;
 use crc::{Crc, CRC_64_REDIS};
 use humansize::{format_size, DECIMAL};
@@ -65,14 +66,14 @@ impl UpgradeWorker {
 
     /// Logic to program a given OS image to a node. Uses a [`DataTransfer`]
     /// abstraction as source of the image data. The transfer can be interrupted
-    /// at any time when the `CancellationToken` is cancelled. When a transfer
-    /// is interrupted or failed, it will always powers off the Node and
-    /// restores the USB mode equally to a successful flow would.
+    /// at any time when the `CancellationToken` is cancelled. Cleanup restores
+    /// the node's pre-flash power bit and the previous USB mode.
     pub async fn flash_node(
         mut self,
         bmc: Arc<BmcApplication>,
         node: NodeId,
     ) -> anyhow::Result<()> {
+        let was_on = bmc.get_node_power(node).await.unwrap_or(false);
         let device = bmc.node_in_flash(node, UsbRoute::Bmc).await?;
 
         let result = async move {
@@ -99,12 +100,28 @@ impl UpgradeWorker {
             tracing::info!("Flashing {node} successful, restoring USB & power settings.");
         }
 
-        // disregarding the result, set the BMC in the finalized state.
-        bmc.activate_slot(node.to_inverse_bitfield(), node.to_bitfield())
-            .await?;
-        bmc.usb_boot(node, false).await?;
-        let (mode, _) = bmc.get_usb_mode().await;
-        bmc.configure_usb(mode).await?;
+        // Restore the node's pre-flash power bit so a failed flash does not
+        // leave persistency and GPIOs disagreeing, and so an already-on node
+        // is not forced off after a successful write.
+        let restore = if was_on {
+            node.to_bitfield()
+        } else {
+            0
+        };
+        if let Err(e) = bmc.activate_slot(restore, node.to_bitfield()).await {
+            tracing::error!("flash cleanup power restore: {:#}", e);
+        }
+        if let Err(e) = bmc.usb_boot(node, false).await {
+            tracing::error!("flash cleanup usb boot: {:#}", e);
+        }
+        match bmc.get_usb_mode().await {
+            Ok((mode, _)) => {
+                if let Err(e) = bmc.configure_usb(mode).await {
+                    tracing::error!("flash cleanup usb restore: {:#}", e);
+                }
+            }
+            Err(e) => tracing::error!("flash cleanup usb mode: {:#}", e),
+        }
         result
     }
 
@@ -147,8 +164,7 @@ impl UpgradeWorker {
         if expected_crc != dev_checksum {
             bail!(
                 "crc error. expected {}, calculated {}",
-                expected_crc.to_string(),
-                dev_checksum.to_string()
+                expected_crc, dev_checksum
             );
         }
 
@@ -156,9 +172,9 @@ impl UpgradeWorker {
     }
 
     pub async fn os_update(mut self) -> anyhow::Result<()> {
-        let file_name = self.data_transfer.file_name()?.to_owned();
+        let file_name = sanitize_upgrade_filename(self.data_transfer.file_name()?)?;
         let source = self.data_transfer.reader().await?;
-        tracing::info!("start firmware upgrade {}", file_name.to_string_lossy());
+        tracing::info!("start firmware upgrade {}", file_name.display());
 
         let mut os_update_img = PathBuf::from(TMP_UPGRADE_DIR);
         os_update_img.push(&file_name);
@@ -176,13 +192,8 @@ impl UpgradeWorker {
         let mut writer = WriteMonitor::new(&mut file, &mut self.written_sender, &crc);
         copy_or_cancel(source, &mut writer, &self.cancel).await?;
 
-        let result = spawn_blocking(move || {
-            Command::new("sh")
-                .arg("-c")
-                .arg(format!("osupdate {}", os_update_img.to_string_lossy()))
-                .status()
-        })
-        .await?;
+        let result = spawn_blocking(move || Command::new("osupdate").arg(&os_update_img).status())
+            .await?;
 
         tokio::fs::remove_dir_all(TMP_UPGRADE_DIR).await?;
 

@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate::utils::transfer_source::validate_download_url;
 use crate::utils::Sha256StreamValidator;
 use crate::Path;
 use anyhow::Context;
@@ -18,7 +19,6 @@ use async_compression::tokio::bufread::XzDecoder;
 use bytes::Bytes;
 use futures::Stream;
 use humansize::DECIMAL;
-use nix::unistd::SysconfVar;
 use reqwest::header::CONTENT_LENGTH;
 use reqwest::Url;
 use std::ffi::OsStr;
@@ -76,9 +76,10 @@ impl DataTransfer {
     }
 
     pub async fn url(url: Url, sha256: Option<bytes::Bytes>) -> anyhow::Result<Self> {
+        validate_download_url(&url)?;
         let file_name = url
             .path_segments()
-            .and_then(|seg| seg.last())
+            .and_then(|mut seg| seg.next_back())
             .or_else(|| url.host_str())
             .unwrap_or("http_file")
             .into();
@@ -181,7 +182,7 @@ impl DataTransfer {
                     .take()
                     .expect("request taken")
                     .bytes_stream()
-                    .map(|res| res.map_err(|e| std::io::Error::new(ErrorKind::Other, e)));
+                    .map(|res| res.map_err(std::io::Error::other));
 
                 Ok(build_reader_object(file_name, sha256.clone(), bytes_stream))
             }
@@ -246,9 +247,20 @@ fn with_decompression_support(
 }
 
 fn available_memory() -> io::Result<u64> {
-    let physical_pages = nix::unistd::sysconf(SysconfVar::_AVPHYS_PAGES)?;
-    let page_size = nix::unistd::sysconf(SysconfVar::PAGE_SIZE)?;
-    Ok(physical_pages
-        .and_then(|pages| page_size.map(|size| size as u64 * pages as u64))
-        .unwrap_or(u64::MAX))
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            let Some(rest) = line.strip_prefix("MemAvailable:") else {
+                continue;
+            };
+            if let Some(kb) = rest.split_whitespace().next() {
+                if let Ok(kb) = kb.parse::<u64>() {
+                    return Ok(kb.saturating_mul(1024));
+                }
+            }
+        }
+    }
+
+    let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)?
+        .unwrap_or(4096) as u64;
+    Ok(page_size.saturating_mul(12_800))
 }

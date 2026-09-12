@@ -55,6 +55,7 @@ where
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn reload_password_cache(
         &mut self,
         password_entries: impl Iterator<Item = (String, String)>,

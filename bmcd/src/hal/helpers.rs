@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 const NODE_COUNT: u8 = 4;
 
@@ -42,10 +43,10 @@ macro_rules! gpio_output_array {
 ///
 /// # Arguments
 ///
-/// * `node_states`     bit-field where each bit represents a node on the
-///     turing-pi board, if bit(n) = 1 equals 'select' and bit(n) = 0 equals
-///     'unselect'.
-/// * `node_mask`       mask which bits to select.
+/// * `node_states` bit-field where each bit represents a node on the
+///   turing-pi board, if bit(n) = 1 equals 'select' and bit(n) = 0 equals
+///   'unselect'.
+/// * `node_mask` mask which bits to select.
 ///
 /// # Returns
 ///
@@ -58,6 +59,29 @@ pub fn bit_iterator(nodes_state: u8, nodes_mask: u8) -> impl Iterator<Item = (us
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_node_power_state;
+
+    #[test]
+    fn parse_enabled_disabled() {
+        assert_eq!(parse_node_power_state("enabled"), Some(true));
+        assert_eq!(parse_node_power_state("disabled\n"), Some(false));
+        assert_eq!(parse_node_power_state("unknown"), None);
+    }
+}
+
+/// Parse sysfs `/sys/bus/platform/devices/nodeN-power/state`.
+#[cfg_attr(feature = "stubbed", allow(dead_code))]
+pub fn parse_node_power_state(value: &str) -> Option<bool> {
+    match value.trim() {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn load_lines(chip: &gpiod::Chip) -> HashMap<String, gpiod::LineId> {
     HashMap::from_iter((0..chip.num_lines()).filter_map(|i| {
         chip.line_info(i)

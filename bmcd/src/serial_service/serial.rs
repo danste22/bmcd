@@ -12,29 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //! Handlers for UART connections to/from nodes
-use std::{ops::Index, path::PathBuf};
+use std::path::PathBuf;
 
-use super::serial_handler::Handler;
+use super::serial_handler::{Handler, SerialError};
 use crate::hal::NodeId;
 use crate::serial_service::serial_handler::HandlerState;
+use tokio::sync::Mutex;
 use tokio_serial::{DataBits, Parity, StopBits};
-use tracing::error;
+use tracing::{error, warn};
+
+const DEFAULT_BAUD: u32 = 115_200;
+const T113_RELIABLE_BAUD: u32 = 230_400;
 
 /// Collection of [`crate::serial_service::serial_handler::Handler`]
 #[derive(Debug)]
 pub struct SerialConnections {
-    handlers: Vec<Handler>,
+    handlers: [Mutex<Handler>; 4],
 }
 
 impl SerialConnections {
-    pub fn new() -> Self {
+    pub fn new(bauds: [u32; 4]) -> Self {
         let paths = get_serial_devices();
+        let handlers = std::array::from_fn(|i| {
+            let baud = bauds[i];
+            if baud > T113_RELIABLE_BAUD {
+                warn!(
+                    "UART baud {} for node {} exceeds {}; T113 may not be reliable",
+                    baud,
+                    i + 1,
+                    T113_RELIABLE_BAUD
+                );
+            }
 
-        let collection = paths.iter().enumerate().map(|(i, path)| {
             let mut handler = Handler::new(
                 i + 1,
-                path,
-                115200,
+                paths[i],
+                baud,
                 DataBits::Eight,
                 Parity::None,
                 StopBits::One,
@@ -44,28 +57,43 @@ impl SerialConnections {
                 error!("handler run error: {}", e);
             }
 
-            handler
+            Mutex::new(handler)
         });
 
-        SerialConnections {
-            handlers: collection.collect(),
-        }
+        SerialConnections { handlers }
     }
 
-    pub fn get_state(&self) -> Vec<HandlerState> {
-        self.handlers.iter().map(Handler::get_state).collect()
+    pub async fn get_state(&self) -> Vec<HandlerState> {
+        let mut states = Vec::with_capacity(4);
+        for handler in &self.handlers {
+            states.push(handler.lock().await.get_state());
+        }
+        states
+    }
+
+    pub async fn handler(&self, node: NodeId) -> tokio::sync::MutexGuard<'_, Handler> {
+        self.handlers[node as usize].lock().await
+    }
+
+    pub async fn set_baud_rate(&self, node: NodeId, baud: u32) -> Result<(), SerialError> {
+        if baud > T113_RELIABLE_BAUD {
+            warn!(
+                "UART baud {} for {} exceeds {}; T113 may not be reliable",
+                baud,
+                node.api_name(),
+                T113_RELIABLE_BAUD
+            );
+        }
+        self.handlers[node as usize]
+            .lock()
+            .await
+            .set_baud_rate(baud)
     }
 }
 
-impl Index<NodeId> for SerialConnections {
-    type Output = Handler;
-
-    fn index(&self, index: NodeId) -> &Self::Output {
-        assert!(
-            self.handlers.len() == 4,
-            "Serial connections not initialized"
-        );
-        &self.handlers[index as usize]
+impl Default for SerialConnections {
+    fn default() -> Self {
+        Self::new([DEFAULT_BAUD; 4])
     }
 }
 

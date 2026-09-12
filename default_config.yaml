@@ -25,6 +25,9 @@ authentication:
   # token. The expiry date is counted from the last successful usage of the
   # token. Value is in seconds.
   token_expires: 10800
+  # Skip authentication for peers on the loopback interface. Local `tpi` on the
+  # BMC relies on this. Set to false to require credentials for localhost too.
+  allow_loopback_bypass: true
 tls:
   certificate: /etc/ssl/certs/bmcd_cert.pem
   private_key: /etc/ssl/certs/bmcd_key.pem

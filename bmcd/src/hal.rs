@@ -74,8 +74,19 @@ impl NodeId {
         1 << self as u8
     }
 
+    #[allow(dead_code)]
     pub fn to_inverse_bitfield(self) -> u8 {
         0b1111 & !(1 << self as u8)
+    }
+
+    /// Legacy API key used in JSON bodies (`node1` … `node4`).
+    pub fn api_name(self) -> &'static str {
+        match self {
+            NodeId::Node1 => "node1",
+            NodeId::Node2 => "node2",
+            NodeId::Node3 => "node3",
+            NodeId::Node4 => "node4",
+        }
     }
 }
 
@@ -87,6 +98,7 @@ impl Display for NodeId {
 
 #[repr(C)]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub enum NodeType {
     RaspberryPi4,
     JetsonTx2,

@@ -92,7 +92,7 @@ impl Handler {
     /// # Returns
     ///
     /// * `SerialError::NotStarted` when [`Self::run`] was not called
-    ///     successfully
+    ///   successfully
     pub fn open_channel(
         &self,
     ) -> Result<
@@ -141,7 +141,7 @@ impl Handler {
     /// # Returns
     ///
     /// * `SerialError::NotStarted` when [`Self::run`] was not called
-    ///     successfully.
+    ///   successfully.
     /// * `SerialError::Stopped` when the handler is not running anymore.
     ///
     pub async fn write(&self, bytes: Bytes) -> Result<(), SerialError> {
@@ -226,6 +226,19 @@ impl Handler {
 
         self.writer = Some(write_sender.downgrade());
         Ok(())
+    }
+
+    /// Restart the UART worker at a new baud. Dropping the previous write
+    /// sender makes the old worker exit and release the port.
+    pub fn set_baud_rate(&mut self, baud_rate: u32) -> Result<(), SerialError> {
+        if self.baud_rate == baud_rate && self.worker_context.is_some() {
+            return Ok(());
+        }
+
+        self.worker_context = None;
+        self.writer = None;
+        self.baud_rate = baud_rate;
+        self.run()
     }
 }
 
