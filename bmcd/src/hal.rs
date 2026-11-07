@@ -96,6 +96,21 @@ impl Display for NodeId {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_name_and_display_stay_distinct() {
+        assert_eq!(NodeId::Node1.api_name(), "node1");
+        assert_eq!(NodeId::Node1.to_string(), "Node 1");
+        assert_eq!(NodeId::Node3.api_name(), "node3");
+        assert_eq!(NodeId::Node3.to_string(), "Node 3");
+        assert_eq!(NodeId::Node4.api_name(), "node4");
+        assert_eq!(NodeId::Node4.to_string(), "Node 4");
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]

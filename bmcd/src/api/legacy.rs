@@ -263,36 +263,62 @@ fn reload_self() -> impl Into<LegacyResponse> {
     ()
 }
 
-async fn get_about() -> impl Into<LegacyResponse> {
-    let bmcd_version = env!("CARGO_PKG_VERSION");
-    let build_time = build_time::build_time_utc!("%Y-%m-%d %H:%M:%S-00:00");
+struct OsReleaseFields {
+    version: Option<String>,
+    buildroot: Option<String>,
+}
 
-    let mut buildroot = "unknown".to_string();
-    let mut version = "unknown".to_string();
-
-    if let Ok(os_release) = read_os_release().await {
-        if let Some(buildroot_edition) = os_release.get("PRETTY_NAME") {
-            buildroot = buildroot_edition.trim_matches('"').to_string();
-        }
-        if let Some(ver) = os_release.get("VERSION") {
-            version = ver.to_string();
-        }
+/// `version` is os-release `VERSION` (firmware). `buildroot` is `PRETTY_NAME`
+/// with surrounding quotes removed. Missing keys stay unset.
+fn os_release_fields(os_release: &HashMap<String, String>) -> OsReleaseFields {
+    OsReleaseFields {
+        version: os_release.get("VERSION").cloned(),
+        buildroot: os_release
+            .get("PRETTY_NAME")
+            .map(|value| value.trim_matches('"').to_string()),
     }
+}
 
-    let hostname = read_hostname().await.unwrap_or_default();
-    let (board_model, board_revision) = read_board_model().await.unwrap_or_default();
-
+fn about_body(
+    fields: &OsReleaseFields,
+    hostname: &str,
+    board_model: &str,
+    board_revision: &str,
+    bmcd_version: &str,
+    build_time: &str,
+) -> serde_json::Value {
     json!(
         {
             "board_model": board_model,
             "board_revision": board_revision,
             "hostname": hostname,
             "api": API_VERSION,
-            "version": version,
+            "version": fields.version.clone().unwrap_or_else(|| "unknown".to_string()),
             "bmcd_version": bmcd_version,
             "buildtime": build_time,
-            "buildroot": buildroot,
+            "buildroot": fields.buildroot.clone().unwrap_or_else(|| "unknown".to_string()),
         }
+    )
+}
+
+async fn get_about() -> impl Into<LegacyResponse> {
+    let fields = match read_os_release().await {
+        Ok(os_release) => os_release_fields(&os_release),
+        Err(_) => OsReleaseFields {
+            version: None,
+            buildroot: None,
+        },
+    };
+    let hostname = read_hostname().await.unwrap_or_default();
+    let (board_model, board_revision) = read_board_model().await.unwrap_or_default();
+
+    about_body(
+        &fields,
+        &hostname,
+        &board_model,
+        &board_revision,
+        env!("CARGO_PKG_VERSION"),
+        build_time::build_time_utc!("%Y-%m-%d %H:%M:%S-00:00"),
     )
 }
 
@@ -480,19 +506,23 @@ async fn set_node_power(bmc: &BmcApplication, query: Query) -> LegacyResponse {
         .into()
 }
 
-async fn get_node_power(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
-    let n1 = get_node_power_status(bmc, NodeId::Node1).await;
-    let n2 = get_node_power_status(bmc, NodeId::Node2).await;
-    let n3 = get_node_power_status(bmc, NodeId::Node3).await;
-    let n4 = get_node_power_status(bmc, NodeId::Node4).await;
-
+fn node_power_body(node1: &str, node2: &str, node3: &str, node4: &str) -> serde_json::Value {
     json!(
      [{
-        "node1": n1,
-        "node2": n2,
-        "node3": n3,
-        "node4": n4,
+        "node1": node1,
+        "node2": node2,
+        "node3": node3,
+        "node4": node4,
     }]
+    )
+}
+
+async fn get_node_power(bmc: &BmcApplication) -> impl Into<LegacyResponse> {
+    node_power_body(
+        &get_node_power_status(bmc, NodeId::Node1).await,
+        &get_node_power_status(bmc, NodeId::Node2).await,
+        &get_node_power_status(bmc, NodeId::Node3).await,
+        &get_node_power_status(bmc, NodeId::Node4).await,
     )
 }
 
@@ -583,10 +613,9 @@ async fn set_usb_mode(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
         .map_err(Into::into)
 }
 
-/// gets the USB configuration from the POV of the configured node.
-async fn get_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
-    let (config, bus_type) = bmc.get_usb_mode().await?;
-
+/// USB mode as the legacy API sends it: one object in an array.
+/// `node` is `NodeId::api_name` (`node1` … `node4`), not the Display form `Node N`.
+fn usb_mode_body(config: UsbConfig, bus_type: &str) -> serde_json::Value {
     let (node, mode, route) = match config {
         UsbConfig::UsbA(node) => (node, UsbMode::Device, UsbRoute::AlternativePort),
         UsbConfig::Bmc(node) => (node, UsbMode::Device, UsbRoute::Bmc),
@@ -594,14 +623,20 @@ async fn get_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
         UsbConfig::Flashing(node, route) => (node, UsbMode::Flash, route),
     };
 
-    Ok(json!(
+    json!(
         [{
             "mode": mode,
             "node": node.api_name(),
             "route": route,
             "bus_type": bus_type,
         }]
-    ))
+    )
+}
+
+/// gets the USB configuration from the POV of the configured node.
+async fn get_usb_mode(bmc: &BmcApplication) -> LegacyResult<serde_json::Value> {
+    let (config, bus_type) = bmc.get_usb_mode().await?;
+    Ok(usb_mode_body(config, &bus_type))
 }
 
 async fn set_cooling_info(bmc: &BmcApplication, query: Query) -> LegacyResult<()> {
@@ -684,10 +719,9 @@ fn parse_node_id(node: Option<&str>) -> LegacyResult<NodeId> {
 }
 
 async fn create_data_transfer(query: &TransferQuery) -> LegacyResult<DataTransfer> {
-    let file = query
-        .file
-        .as_deref()
-        .ok_or(LegacyResponse::bad_request("Invalid `file` query parameter"))?;
+    let file = query.file.as_deref().ok_or(LegacyResponse::bad_request(
+        "Invalid `file` query parameter",
+    ))?;
 
     if query.local.is_some() {
         let path = validate_local_transfer_path(Path::new(file))
@@ -796,6 +830,75 @@ async fn return_transfer_error(ss: web::Data<StreamingDataService>) -> impl Into
 mod test {
 
     use super::*;
+
+    #[test]
+    fn about_keeps_firmware_version_apart_from_daemon_version() {
+        let os_release = HashMap::from([
+            ("VERSION".to_string(), "2.3.4".to_string()),
+            (
+                "PRETTY_NAME".to_string(),
+                "\"Buildroot 2026.08\"".to_string(),
+            ),
+        ]);
+        let body = about_body(
+            &os_release_fields(&os_release),
+            "turingpi",
+            "Turing Pi 2.5",
+            "1.0",
+            "2.4.0",
+            "2026-11-06 10:00:00-00:00",
+        );
+
+        assert_eq!(body["version"], "2.3.4");
+        assert_eq!(body["bmcd_version"], "2.4.0");
+        assert_eq!(body["buildroot"], "Buildroot 2026.08");
+        assert_eq!(body["api"], API_VERSION);
+        assert!(body.get("build_version").is_none());
+    }
+
+    #[test]
+    fn about_uses_unknown_when_os_release_has_no_version() {
+        let body = about_body(
+            &OsReleaseFields {
+                version: None,
+                buildroot: None,
+            },
+            "",
+            "",
+            "",
+            env!("CARGO_PKG_VERSION"),
+            "2026-11-06 10:00:00-00:00",
+        );
+
+        assert_eq!(body["version"], "unknown");
+        assert_eq!(body["buildroot"], "unknown");
+        assert_eq!(body["bmcd_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn usb_mode_uses_api_node_name() {
+        let body = usb_mode_body(UsbConfig::Node(NodeId::Node3, UsbRoute::Bmc), "Single bus");
+
+        assert_eq!(body[0]["node"], "node3");
+        assert_eq!(body[0]["mode"], "Host");
+        assert_eq!(body[0]["route"], "Bmc");
+        assert_eq!(body[0]["bus_type"], "Single bus");
+    }
+
+    #[test]
+    fn node_power_uses_node1_to_node4_keys() {
+        let body = node_power_body("1", "0", "1", "0");
+
+        assert_eq!(
+            body,
+            json!([{
+                "node1": "1",
+                "node2": "0",
+                "node3": "1",
+                "node4": "0",
+            }])
+        );
+    }
 
     #[actix_web::test]
     async fn test_node_info() {

@@ -319,9 +319,54 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
+            StreamingDataService::flash_status_code(&StreamingState::Done(
+                Duration::from_secs(1),
+                0
+            )),
+            StatusCode::OK
+        );
+        assert_eq!(
             StreamingDataService::flash_status_code(&StreamingState::Error("boom".into())),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn flash_status_json_matches_the_ui_contract() {
+        let error = serde_json::to_value(StreamingState::Error(
+            "failed firmware upgrade (exit status: 255)".into(),
+        ))
+        .unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({"Error": "failed firmware upgrade (exit status: 255)"})
+        );
+
+        let done = serde_json::to_value(StreamingState::Done(Duration::from_secs(42), 0)).unwrap();
+        assert_eq!(
+            done,
+            serde_json::json!({"Done": [{"secs": 42, "nanos": 0}, 0]})
+        );
+
+        let (sender, written) = watch::channel(7_u64);
+        let context = TransferContext::new(
+            1,
+            "firmware upgrade service".into(),
+            100,
+            written,
+            None,
+            CancellationToken::new(),
+        );
+        let transferring = serde_json::to_value(StreamingState::Transferring(context)).unwrap();
+        assert_eq!(transferring["Transferring"]["id"], 1);
+        assert_eq!(
+            transferring["Transferring"]["process_name"],
+            "firmware upgrade service"
+        );
+        assert_eq!(transferring["Transferring"]["size"], 100);
+        assert_eq!(transferring["Transferring"]["bytes_written"], 7);
+        assert_eq!(transferring["Transferring"]["cancelled"], false);
+        drop(sender);
     }
 }
 
