@@ -14,8 +14,72 @@
 use crc::{Crc, Digest as CrcDigest};
 use futures::Stream;
 use sha2::{Digest, Sha256};
-use std::{io, pin::Pin, task::Poll};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::{pin::Pin, task::Poll};
 use tokio::{io::AsyncWrite, sync::watch};
+
+/// Write `bytes` to a new or truncated file and flush them to stable storage.
+///
+/// Used by [`write_durably`] for the temporary file, and by callers that keep a
+/// side copy under a name of their own before linking it into place.
+pub fn write_synced(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if let Some(mode) = mode {
+        opts.mode(mode);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Replace `path` with `bytes` so a power cut cannot leave a truncated file.
+///
+/// Temp file in the same directory, `sync_all` on the data, rename, then
+/// `sync_all` on the directory so the name itself reaches the media. A rename
+/// alone is atomic as a name swap; without the syncs, UBIFS can still lose the
+/// data behind a correctly named empty or truncated file.
+pub fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_durably_with_mode(path, bytes, None)
+}
+
+/// Same as [`write_durably`], with an explicit Unix mode for the new file
+/// (private keys, for example).
+pub fn write_durably_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // pid + nanos: two writers of the same file, in this process or another,
+    // must not share a temp name.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
+    write_synced(&tmp, bytes, mode).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    // The directory entry is what names the file; sync it too. The rename
+    // already put the new bytes under `path`, so a sync failure must not be
+    // reported as "write failed" — callers would undo backups of a live file.
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            "{} was replaced, but syncing {} failed: {e}",
+            path.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
 
 pub struct Sha256StreamValidator<T>
 where
@@ -175,6 +239,29 @@ mod test {
         let mut array = vec![0; SIZE];
         rand::rng().fill_bytes(&mut array);
         array
+    }
+
+    #[test]
+    fn write_durably_replaces_the_file_and_leaves_no_tmp() {
+        let dir = tempdir::TempDir::new("write-durably").expect("temp dir");
+        let path = dir.path().join("switch.json");
+        std::fs::write(&path, b"old").unwrap();
+        write_durably(&path, b"new confirmed").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new confirmed");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_durably_creates_missing_parents() {
+        let dir = tempdir::TempDir::new("write-durably-parents").expect("temp dir");
+        let path = dir.path().join("etc").join("bmcd").join("switch.json");
+        write_durably(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
     }
 
     #[tokio::test]

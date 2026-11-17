@@ -33,6 +33,7 @@ use crate::app::address_change::{
 };
 use crate::app::address_document::{parse, resolv_conf, AddressDocument};
 use crate::app::network_interfaces::{InterfaceInfo, MANAGED};
+use crate::utils::{write_durably, write_synced};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -293,7 +294,7 @@ impl AddressService {
             let wanted = inner.running.render();
             let have = std::fs::read_to_string(&self.path).unwrap_or_default();
             if have != wanted {
-                match write_atomically(&self.path, wanted.as_bytes()) {
+                match write_durably(&self.path, wanted.as_bytes()) {
                     Ok(()) => {
                         inner.stamp = modified(&self.path);
                         done.file_rewritten = true;
@@ -435,7 +436,7 @@ impl AddressService {
             }
             backup = Some(kept);
         }
-        if let Err(e) = write_atomically(&self.path, document.render().as_bytes()) {
+        if let Err(e) = write_durably(&self.path, document.render().as_bytes()) {
             if let Some(kept) = &backup {
                 let _ = std::fs::remove_file(kept);
             }
@@ -539,7 +540,7 @@ fn keep_a_copy_at(path: &Path, seconds: u64) -> std::io::Result<(PathBuf, Vec<Pa
     // never overwritten.
     let tmp = path.with_file_name(format!("{prefix}tmp"));
     let result = (|| {
-        std::fs::write(&tmp, &bytes)?;
+        write_synced(&tmp, &bytes, None)?;
         for attempt in 0u32.. {
             let candidate = if attempt == 0 {
                 format!("{prefix}{seconds}")
@@ -589,14 +590,6 @@ fn prune_copies(dir: &Path, prefix: &str, just_made: &Path) -> Vec<PathBuf> {
         }
     }
     removed
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -732,13 +725,18 @@ mod tests {
     /// A board in a temp dir: the file, `/sys/class/net` with or without
     /// `br0`, and an `ip` that prints `addr` and `route`.
     fn rig(file: Option<&str>, br0: bool, exec: Arc<FakeExec>) -> Rig {
+        rig_named("interfaces", file, br0, exec)
+    }
+
+    /// [`rig`], with the interfaces file under a name of the test's choosing.
+    fn rig_named(name: &str, file: Option<&str>, br0: bool, exec: Arc<FakeExec>) -> Rig {
         let dir = tempdir::TempDir::new("address-board").expect("temp dir");
         let net = dir.path().join("net");
         std::fs::create_dir_all(&net).unwrap();
         if br0 {
             std::fs::create_dir_all(net.join("br0/bridge")).unwrap();
         }
-        let path = dir.path().join("etc/interfaces");
+        let path = dir.path().join("etc").join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         if let Some(file) = file {
             std::fs::write(&path, file).unwrap();
@@ -1059,16 +1057,24 @@ mod tests {
     /// view must not claim a file that was never written.
     #[tokio::test]
     async fn a_write_that_fails_leaves_the_change_pending_and_the_view_unchanged() {
-        let rig = board(Some(HAND_FILE), true);
+        // The write goes through `<name>.tmp.<pid>.<nanos>`, which cannot be
+        // blocked in advance, and root ignores permissions. A name long enough
+        // that the copy (`<name>.hand-written.<seconds>`) still fits in 255
+        // bytes but the temp file does not makes the write itself fail, after
+        // the copy is made.
+        let name = "i".repeat(230);
+        let rig = rig_named(
+            &name,
+            Some(HAND_FILE),
+            true,
+            FakeExec::board(ADDR_STOCK, ROUTE_STOCK),
+        );
         let pending = rig
             .service
             .apply(lan(), DEFAULT_WINDOW, true)
             .await
             .unwrap();
         let before = rig.service.view().await;
-        // Writing goes through `interfaces.tmp`; a directory there stops it.
-        let blocker = rig.file.with_extension("tmp");
-        std::fs::create_dir(&blocker).unwrap();
 
         let error = rig
             .service
@@ -1095,20 +1101,9 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
-            names
-                .iter()
-                .all(|n| !n.starts_with("interfaces.hand-written.")),
+            names.iter().all(|n| !n.contains(".hand-written.")),
             "{names:?}"
         );
-
-        // Confirming again, once the disk allows it, works.
-        std::fs::remove_dir(&blocker).unwrap();
-        rig.service.confirm(&pending.token).await.expect("retry");
-        let view = rig.service.view().await;
-        assert!(view.pending.is_none());
-        assert_eq!(view.file, FileOrigin::Bmcd);
-        assert_eq!(view.configured, Some(lan()));
-        assert!(view.file_backup.is_some());
     }
 
     /// A Latin-1 byte in a comment made the file "not found" and so DHCP:
