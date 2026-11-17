@@ -37,11 +37,11 @@
 
 use crate::app::switch_document::{PortId, SwitchDocument};
 
-/// The kernel's name for each port, as the device tree spells it.
+/// The kernel's name for each front-panel / node port, as the device tree
+/// spells it.
 ///
-/// The BMC's own port is deliberately absent: it is the CPU port, it has no
-/// netdev, and its VLAN membership is a property of the bridge itself rather
-/// than of an interface that can be named on a command line.
+/// The BMC's own port has no netdev, so it is absent here. Its VLAN membership
+/// is programmed on the bridge with the `self` flag — see [`vlan_target`].
 pub fn interface_name(port: PortId) -> Option<&'static str> {
     match port {
         PortId::Node1 => Some("node1"),
@@ -57,12 +57,61 @@ pub fn interface_name(port: PortId) -> Option<&'static str> {
 /// The bridge every switch port is enslaved to.
 pub const BRIDGE: &str = "br0";
 
+/// Where a port's VLAN membership is written: netdev name, and whether the
+/// command needs the bridge `self` flag.
+///
+/// Front-panel ports are their own devices. The BMC is the CPU port: there is
+/// no `bmc` netdev, so membership is `bridge vlan … dev br0 … self`.
+fn vlan_target(port: PortId) -> (&'static str, bool) {
+    match interface_name(port) {
+        Some(name) => (name, false),
+        None => (BRIDGE, true),
+    }
+}
+
 /// One command, as argv. A string would have to be parsed by a shell, and a
 /// shell is not something this needs between it and the kernel.
 pub type Command = Vec<String>;
 
 fn cmd(parts: &[&str]) -> Command {
     parts.iter().map(|part| part.to_string()).collect()
+}
+
+fn vlan_del(dev: &str, vid: u16, bridge_self: bool) -> Command {
+    // `self` last: that is how `bridge` marks the bridge's own VLAN entry.
+    let mut out = vec![
+        "bridge".into(),
+        "vlan".into(),
+        "del".into(),
+        "dev".into(),
+        dev.into(),
+        "vid".into(),
+        vid.to_string(),
+    ];
+    if bridge_self {
+        out.push("self".into());
+    }
+    out
+}
+
+fn vlan_add(dev: &str, vid: u16, pvid_untagged: bool, bridge_self: bool) -> Command {
+    let mut out = vec![
+        "bridge".into(),
+        "vlan".into(),
+        "add".into(),
+        "dev".into(),
+        dev.into(),
+        "vid".into(),
+        vid.to_string(),
+    ];
+    if pvid_untagged {
+        out.push("pvid".into());
+        out.push("untagged".into());
+    }
+    if bridge_self {
+        out.push("self".into());
+    }
+    out
 }
 
 /// Every command needed to move the switch from `running` to `wanted`.
@@ -96,30 +145,19 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
     }
 
     // Remove what is no longer wanted, before adding, so a port moving from
-    // one untagged VLAN to another is never briefly in both.
+    // one untagged VLAN to another is never briefly in both. Includes the
+    // BMC's `br0 self` entry in the same pass as the front-panel ports.
     for port in PortId::ALL {
-        let Some(name) = interface_name(port) else {
-            continue;
-        };
+        let (dev, bridge_self) = vlan_target(port);
         let was = running.ports.get(&port).cloned().unwrap_or_default();
         let now = wanted.ports.get(&port).cloned().unwrap_or_default();
         for vid in was.vlans().difference(&now.vlans()) {
-            commands.push(cmd(&[
-                "bridge",
-                "vlan",
-                "del",
-                "dev",
-                name,
-                "vid",
-                &vid.to_string(),
-            ]));
+            commands.push(vlan_del(dev, *vid, bridge_self));
         }
     }
 
     for port in PortId::ALL {
-        let Some(name) = interface_name(port) else {
-            continue;
-        };
+        let (dev, bridge_self) = vlan_target(port);
         let was = running.ports.get(&port).cloned().unwrap_or_default();
         let now = wanted.ports.get(&port).cloned().unwrap_or_default();
 
@@ -127,29 +165,11 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
             if was.tagged.contains(vid) {
                 continue;
             }
-            commands.push(cmd(&[
-                "bridge",
-                "vlan",
-                "add",
-                "dev",
-                name,
-                "vid",
-                &vid.to_string(),
-            ]));
+            commands.push(vlan_add(dev, *vid, false, bridge_self));
         }
         if let Some(vid) = now.untagged {
             if was.untagged != Some(vid) {
-                commands.push(cmd(&[
-                    "bridge",
-                    "vlan",
-                    "add",
-                    "dev",
-                    name,
-                    "vid",
-                    &vid.to_string(),
-                    "pvid",
-                    "untagged",
-                ]));
+                commands.push(vlan_add(dev, vid, true, bridge_self));
             }
         }
     }
@@ -209,13 +229,39 @@ mod tests {
         assert!(plan(&Preset::Flat.expand(), &Preset::Flat.expand()).is_empty());
     }
 
-    /// The BMC's own port has no netdev, so it can never appear on a command
-    /// line. Emitting one would fail at the first apply.
+    /// The BMC has no `bmc` netdev. Membership is `dev br0 … self`. Emitting
+    /// `dev bmc` would fail at the first apply; omitting `self` leaves the
+    /// BMC on VID 1 while Split/Trunk clear VID 1 from the front ports.
     #[test]
     fn no_command_ever_names_the_bmc_port() {
         let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
         assert!(!lines.iter().any(|l| l.contains("dev bmc")), "{lines:#?}");
         assert_eq!(interface_name(PortId::Bmc), None);
+    }
+
+    #[test]
+    fn the_bmc_vlan_is_programmed_on_br0_self() {
+        let to_trunk = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        assert!(
+            to_trunk
+                .iter()
+                .any(|l| l == "bridge vlan del dev br0 vid 1 self"),
+            "leave Flat's VID 1 on the bridge itself: {to_trunk:#?}"
+        );
+        assert!(
+            to_trunk
+                .iter()
+                .any(|l| l == "bridge vlan add dev br0 vid 10 pvid untagged self"),
+            "join the management VLAN on the bridge itself: {to_trunk:#?}"
+        );
+
+        let to_split = joined(&plan(&Preset::Flat.expand(), &Preset::Split.expand()));
+        assert!(
+            to_split
+                .iter()
+                .any(|l| l.contains("dev br0") && l.ends_with(" self")),
+            "Split must program br0 self: {to_split:#?}"
+        );
     }
 
     /// A name is not a switch setting. Renaming a VLAN must not touch the

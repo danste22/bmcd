@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Split and Trunk left the BMC on VLAN 1.** `plan()` skipped `PortId::Bmc`
+  because it has no netdev. The BMC's membership is the bridge `self` entry
+  (`bridge vlan … dev br0 … self`). Without that, Flat→Split/Trunk cleared
+  VID 1 from the front ports while `br0` stayed on the kernel default, the
+  board went unreachable, and the confirm window reverted the change. The
+  planner now adds and deletes those `self` lines in the same order as the
+  other ports.
+
 ## [2.43.0] — 2026-11-14
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
