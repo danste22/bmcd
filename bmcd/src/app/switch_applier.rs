@@ -35,7 +35,7 @@
 //! the network in the middle of its own reconfiguration -- which the confirm
 //! window would recover, but only after making an operator watch it happen.
 
-use crate::app::switch_document::{PortId, SwitchDocument};
+use crate::app::switch_document::{PortConfig, PortId, SecondUplink, SwitchDocument};
 
 /// The kernel's name for each front-panel / node port, as the device tree
 /// spells it.
@@ -50,9 +50,24 @@ pub fn interface_name(port: PortId) -> Option<&'static str> {
         PortId::Node4 => Some("node4"),
         PortId::Ge0 => Some("ge0"),
         PortId::Ge1 => Some("ge1"),
+        PortId::Bond0 => Some("bond0"),
         PortId::Bmc => None,
     }
 }
+
+/// Ports whose VLAN membership is programmed with `bridge vlan` for this
+/// document: every physical port, plus `bond0` when it is in the table.
+fn vlan_ports(document: &SwitchDocument) -> Vec<PortId> {
+    let mut ports: Vec<PortId> = PortId::ALL.to_vec();
+    if document.ports.contains_key(&PortId::Bond0) {
+        ports.push(PortId::Bond0);
+    }
+    ports
+}
+
+pub const BOND: &str = "bond0";
+pub const BOND_MODE: &str = "802.3ad";
+pub const BOND_MIIMON: &str = "100";
 
 /// The bridge every switch port is enslaved to.
 pub const BRIDGE: &str = "br0";
@@ -124,6 +139,8 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
 
     let turning_on = wanted.vlan_filtering && !running.vlan_filtering;
     let turning_off = !wanted.vlan_filtering && running.vlan_filtering;
+    let was_lag = running.second_uplink == SecondUplink::Lag;
+    let now_lag = wanted.second_uplink == SecondUplink::Lag;
 
     // ON FIRST. A bridge with filtering on and no VLANs yet forwards nothing,
     // so the VLANs have to exist before it starts caring about them... and
@@ -144,35 +161,19 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
         ]));
     }
 
-    // Remove what is no longer wanted, before adding, so a port moving from
-    // one untagged VLAN to another is never briefly in both. Includes the
-    // BMC's `br0 self` entry in the same pass as the front-panel ports.
-    for port in PortId::ALL {
-        let (dev, bridge_self) = vlan_target(port);
-        let was = running.ports.get(&port).cloned().unwrap_or_default();
-        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
-        for vid in was.vlans().difference(&now.vlans()) {
-            commands.push(vlan_del(dev, *vid, bridge_self));
-        }
+    // VLAN dels always before adds. Bond create/destroy sits between them so
+    // ge0/ge1 are not briefly both bridged and bonded with the wrong vids.
+    // After a port joins the bridge the kernel gives it default_pvid 1; clear
+    // that before the adds when the document does not want VID 1.
+    plan_vlan_dels(&mut commands, running, wanted);
+    if was_lag && !now_lag {
+        commands.extend(teardown_lag());
+        plan_kernel_pvid_clear(&mut commands, wanted, &[PortId::Ge0, PortId::Ge1]);
+    } else if !was_lag && now_lag {
+        commands.extend(setup_lag());
+        plan_kernel_pvid_clear(&mut commands, wanted, &[PortId::Bond0]);
     }
-
-    for port in PortId::ALL {
-        let (dev, bridge_self) = vlan_target(port);
-        let was = running.ports.get(&port).cloned().unwrap_or_default();
-        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
-
-        for vid in &now.tagged {
-            if was.tagged.contains(vid) {
-                continue;
-            }
-            commands.push(vlan_add(dev, *vid, false, bridge_self));
-        }
-        if let Some(vid) = now.untagged {
-            if was.untagged != Some(vid) {
-                commands.push(vlan_add(dev, vid, true, bridge_self));
-            }
-        }
-    }
+    plan_vlan_adds(&mut commands, running, wanted, was_lag, now_lag);
 
     if turning_on {
         commands.push(cmd(&[
@@ -205,6 +206,131 @@ pub fn plan(running: &SwitchDocument, wanted: &SwitchDocument) -> Vec<Command> {
     commands
 }
 
+fn plan_vlan_dels(commands: &mut Vec<Command>, running: &SwitchDocument, wanted: &SwitchDocument) {
+    let mut ports = vlan_ports(running);
+    for port in vlan_ports(wanted) {
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    for port in ports {
+        let (dev, bridge_self) = vlan_target(port);
+        let was = running.ports.get(&port).cloned().unwrap_or_default();
+        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
+        for vid in was.vlans().difference(&now.vlans()) {
+            commands.push(vlan_del(dev, *vid, bridge_self));
+        }
+    }
+}
+
+/// Drop the kernel `default_pvid` left on a port that just joined `br0`.
+fn plan_kernel_pvid_clear(commands: &mut Vec<Command>, wanted: &SwitchDocument, ports: &[PortId]) {
+    for &port in ports {
+        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
+        if now.vlans().contains(&1) {
+            continue;
+        }
+        let (dev, bridge_self) = vlan_target(port);
+        commands.push(vlan_del(dev, 1, bridge_self));
+    }
+}
+
+fn plan_vlan_adds(
+    commands: &mut Vec<Command>,
+    running: &SwitchDocument,
+    wanted: &SwitchDocument,
+    was_lag: bool,
+    now_lag: bool,
+) {
+    let mut ports = vlan_ports(wanted);
+    for port in vlan_ports(running) {
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    for port in ports {
+        let (dev, bridge_self) = vlan_target(port);
+        let was = effective_was(port, running, was_lag, now_lag);
+        let now = wanted.ports.get(&port).cloned().unwrap_or_default();
+
+        for vid in &now.tagged {
+            if was.tagged.contains(vid) {
+                continue;
+            }
+            commands.push(vlan_add(dev, *vid, false, bridge_self));
+        }
+        if let Some(vid) = now.untagged {
+            if was.untagged != Some(vid) {
+                commands.push(vlan_add(dev, vid, true, bridge_self));
+            }
+        }
+    }
+}
+
+/// Previous VLAN membership as the kernel will have it when add commands run.
+///
+/// After `setup_lag` / `teardown_lag`, a newly enslaved port carries
+/// `default_pvid` 1 even if the prior document listed no VLANs for it.
+fn effective_was(
+    port: PortId,
+    running: &SwitchDocument,
+    was_lag: bool,
+    now_lag: bool,
+) -> PortConfig {
+    let raw = running.ports.get(&port).cloned().unwrap_or_default();
+    let just_joined_bridge = match port {
+        PortId::Bond0 => !was_lag && now_lag,
+        PortId::Ge0 | PortId::Ge1 => was_lag && !now_lag,
+        _ => false,
+    };
+    if just_joined_bridge {
+        PortConfig::untagged(1)
+    } else {
+        raw
+    }
+}
+
+fn setup_lag() -> Vec<Command> {
+    vec![
+        cmd(&[
+            "ip",
+            "link",
+            "add",
+            BOND,
+            "type",
+            "bond",
+            "mode",
+            BOND_MODE,
+            "miimon",
+            BOND_MIIMON,
+        ]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "nomaster"]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "nomaster"]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "down"]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "down"]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "master", BOND]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "master", BOND]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "up"]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "up"]),
+        cmd(&["ip", "link", "set", "dev", BOND, "up"]),
+        cmd(&["ip", "link", "set", "dev", BOND, "master", BRIDGE]),
+    ]
+}
+
+fn teardown_lag() -> Vec<Command> {
+    vec![
+        cmd(&["ip", "link", "set", "dev", BOND, "nomaster"]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "nomaster"]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "nomaster"]),
+        cmd(&["ip", "link", "set", "dev", BOND, "down"]),
+        cmd(&["ip", "link", "delete", BOND]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "master", BRIDGE]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "master", BRIDGE]),
+        cmd(&["ip", "link", "set", "dev", "ge0", "up"]),
+        cmd(&["ip", "link", "set", "dev", "ge1", "up"]),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,7 +352,7 @@ mod tests {
     #[test]
     fn applying_a_document_to_itself_does_nothing() {
         assert!(plan(&trunk(), &trunk()).is_empty());
-        assert!(plan(&Preset::Flat.expand(), &Preset::Flat.expand()).is_empty());
+        assert!(plan(&Preset::flat().expand(), &Preset::flat().expand()).is_empty());
     }
 
     /// The BMC has no `bmc` netdev. Membership is `dev br0 … self`. Emitting
@@ -234,14 +360,14 @@ mod tests {
     /// BMC on VID 1 while Split/Trunk clear VID 1 from the front ports.
     #[test]
     fn no_command_ever_names_the_bmc_port() {
-        let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let lines = joined(&plan(&Preset::flat().expand(), &trunk()));
         assert!(!lines.iter().any(|l| l.contains("dev bmc")), "{lines:#?}");
         assert_eq!(interface_name(PortId::Bmc), None);
     }
 
     #[test]
     fn the_bmc_vlan_is_programmed_on_br0_self() {
-        let to_trunk = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let to_trunk = joined(&plan(&Preset::flat().expand(), &trunk()));
         assert!(
             to_trunk
                 .iter()
@@ -255,7 +381,7 @@ mod tests {
             "join the management VLAN on the bridge itself: {to_trunk:#?}"
         );
 
-        let to_split = joined(&plan(&Preset::Flat.expand(), &Preset::Split.expand()));
+        let to_split = joined(&plan(&Preset::flat().expand(), &Preset::Split.expand()));
         assert!(
             to_split
                 .iter()
@@ -283,7 +409,7 @@ mod tests {
     /// forwards nothing.
     #[test]
     fn filtering_goes_on_last_and_comes_off_first() {
-        let on = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let on = joined(&plan(&Preset::flat().expand(), &trunk()));
         let index = on
             .iter()
             .position(|l| l.contains("vlan_filtering 1"))
@@ -294,7 +420,7 @@ mod tests {
             "filtering should be enabled after the VLANs: {on:#?}"
         );
 
-        let off = joined(&plan(&trunk(), &Preset::Flat.expand()));
+        let off = joined(&plan(&trunk(), &Preset::flat().expand()));
         let index = off
             .iter()
             .position(|l| l.contains("vlan_filtering 0"))
@@ -317,7 +443,7 @@ mod tests {
 
     #[test]
     fn an_untagged_vlan_is_added_as_pvid_untagged() {
-        let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let lines = joined(&plan(&Preset::flat().expand(), &trunk()));
         assert!(
             lines
                 .iter()
@@ -328,7 +454,7 @@ mod tests {
 
     #[test]
     fn a_tagged_vlan_is_added_without_pvid() {
-        let lines = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let lines = joined(&plan(&Preset::flat().expand(), &trunk()));
         assert!(
             lines.iter().any(|l| l == "bridge vlan add dev ge0 vid 10"),
             "{lines:#?}"
@@ -340,7 +466,7 @@ mod tests {
 
     #[test]
     fn spanning_tree_is_only_touched_when_it_changes() {
-        let with_stp = joined(&plan(&Preset::Flat.expand(), &trunk()));
+        let with_stp = joined(&plan(&Preset::flat().expand(), &trunk()));
         assert!(with_stp.iter().any(|l| l.contains("stp_state 1")));
 
         let no_change = joined(&plan(&trunk(), &trunk()));
@@ -365,6 +491,84 @@ mod tests {
                 .iter()
                 .all(|l| l.contains("ge1") || l.contains("stp_state")),
             "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn flat_to_flat_lag_creates_bond0_and_clears_ge_vlans() {
+        let flat = Preset::flat().expand();
+        let lag = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let lines = joined(&plan(&flat, &lag));
+        assert!(
+            lines.iter().any(|l| l.contains("link add bond0 type bond")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ip link set dev bond0 master br0"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("vlan del dev ge0") || l.contains("vlan del dev ge1")),
+            "slaves leave the flat VLAN before bonding: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn lag_to_flat_tears_down_bond0() {
+        let lag = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let flat = Preset::flat().expand();
+        let lines = joined(&plan(&lag, &flat));
+        assert!(
+            lines.iter().any(|l| l == "ip link delete bond0"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "ip link set dev ge0 master br0"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn flat_to_trunk_lag_clears_kernel_default_pvid_on_bond0() {
+        let flat = Preset::flat().expand();
+        let lag = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let lines = joined(&plan(&flat, &lag));
+        assert!(
+            lines.iter().any(|l| l == "bridge vlan del dev bond0 vid 1"),
+            "bond0 joins br0 with default_pvid 1: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn lag_to_trunk_clears_kernel_default_pvid_on_ge_ports() {
+        let lag = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let trunk = trunk();
+        let lines = joined(&plan(&lag, &trunk));
+        assert!(
+            lines.iter().any(|l| l == "bridge vlan del dev ge0 vid 1"),
+            "ge0 rejoins br0 with default_pvid 1: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "bridge vlan del dev ge1 vid 1"),
+            "ge1 rejoins br0 with default_pvid 1: {lines:#?}"
         );
     }
 }

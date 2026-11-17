@@ -187,6 +187,16 @@ fn components() -> serde_json::Map<String, Value> {
             serde_json::to_value(schemars::schema_for!(crate::app::switch_info::SwitchPort)),
         ),
         (
+            "SwitchDocument",
+            serde_json::to_value(schemars::schema_for!(
+                crate::app::switch_document::SwitchDocument
+            )),
+        ),
+        (
+            "SwitchPreset",
+            serde_json::to_value(schemars::schema_for!(crate::app::switch_document::Preset)),
+        ),
+        (
             "FirmwareSlots",
             serde_json::to_value(schemars::schema_for!(
                 crate::app::firmware_info::FirmwareSlots
@@ -414,21 +424,34 @@ fn access_paths() -> Vec<(String, Value)> {
                 "put": {
                     "summary": "Apply a configuration, to be confirmed",
                     "operationId": "applySwitch",
-                    "description": "Takes a preset or a whole document, and an optional \
-                                    `window_s`. Answers **202**, not 200: the change is on the \
-                                    switch but it is not yours to keep yet. Confirm within the \
-                                    window or the board puts the previous configuration back by \
-                                    itself. The window does not start counting until the uplink \
-                                    carrying the BMC's VLAN reports forwarding, because spanning \
-                                    tree holds a port for its own forwarding delay first -- \
-                                    counting from the apply would revert every correct change.",
+                    "description": "Takes a preset (`flat`, `split` or `trunk`; `flat` and \
+                                    `trunk` take an optional `second_uplink`, and \
+                                    `second_uplink: lag` is LACP on `bond0`) or a whole document \
+                                    with optional `second_uplink` (`redundant` | `off` | `lag`) \
+                                    and `bond0` when LACP is on, plus optional `window_s` and \
+                                    `replace_hand_written`. Answers **202**, not 200: the change \
+                                    is on the switch but it is not yours to keep yet. Confirm \
+                                    within the window or the board puts the previous \
+                                    configuration back by itself. The window does not start \
+                                    counting until the uplink carrying the BMC's VLAN reports \
+                                    forwarding, because spanning tree holds a port for its own \
+                                    forwarding delay first -- counting from the apply would \
+                                    revert every correct change.",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
                         "type": "object",
-                        "description": "A preset or a document, plus an optional window_s."
+                        "description": "A preset or SwitchDocument, plus optional window_s and \
+                                        replace_hand_written.",
+                        "properties": {
+                            "window_s": { "type": "integer" },
+                            "replace_hand_written": { "type": "boolean" },
+                            "preset": { "type": "string", "enum": ["flat", "split", "trunk"] },
+                            "second_uplink": { "type": "string", "enum": ["redundant", "off", "lag"] }
+                        }
                     })}}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
-                        "409": { "description": "The board has no br0, the bridge over the switch ports. Nothing was changed.",
+                        "409": { "description": "No br0, or /etc/network/interfaces is hand-written \
+                                                 and replace_hand_written was not set.",
                                  "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
@@ -486,11 +509,14 @@ fn access_paths() -> Vec<(String, Value)> {
                     "summary": "The switch presets, expanded by the board",
                     "operationId": "getSwitchPresets",
                     "description": "Each preset's full port table, so every client previews the \
-                                    same thing. A client that expanded a preset itself would \
-                                    eventually disagree with the board about what it means, and \
-                                    that disagreement shows up as a board nobody can reach. \
-                                    `trunk` is shown with example VLAN identifiers; the real ones \
-                                    are the operator's, because the router has to match them.",
+                                    same thing. Names are unique labels: `flat`, `flat-lag`, \
+                                    `split`, `trunk`, `trunk-lag`; each preset's `preset` field \
+                                    is what to send back to choose it. A client that expanded a preset itself \
+                                    would eventually disagree with the board about what it means, \
+                                    and that disagreement shows up as a board nobody can reach. \
+                                    `trunk` / `trunk-lag` are shown with example VLAN identifiers; \
+                                    the real ones are the operator's, because the router has to \
+                                    match them. Lag presets put uplink VLANs on `bond0`.",
                     "responses": {
                         "200": { "description": "Every preset, with the board's own warnings." },
                         "default": problem

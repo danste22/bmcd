@@ -54,10 +54,14 @@ pub fn config(cfg: &mut web::ServiceConfig) {
 /// A preset, expanded, with whatever the board would say about it.
 #[derive(Debug, Serialize)]
 struct PresetView {
-    /// `flat`, `split`, `trunk`.
+    /// `flat`, `flat-lag`, `split`, `trunk`, `trunk-lag`. A label for the
+    /// list, not a value to send back: `preset` is that.
     name: &'static str,
     /// One sentence for the person choosing.
     summary: &'static str,
+    /// What to send as the proposal to choose this preset, for example
+    /// `{"preset":"flat","second_uplink":"lag"}` for `flat-lag`.
+    preset: Preset,
     /// The document this preset means, port by port.
     document: SwitchDocument,
     warnings: Vec<Warning>,
@@ -118,7 +122,15 @@ async fn get_presets() -> HttpResponse {
             "flat",
             "One network. Every module, the BMC and both uplinks share it, and the switch does \
              not look at VLANs at all. This is how a board ships.",
-            Preset::Flat,
+            Preset::flat(),
+        ),
+        (
+            "flat-lag",
+            "Same single network as flat, with ge0 and ge1 bonded as bond0 (802.3ad LACP) for \
+             the uplink.",
+            Preset::Flat {
+                second_uplink: SecondUplink::Lag,
+            },
         ),
         (
             "split",
@@ -134,6 +146,16 @@ async fn get_presets() -> HttpResponse {
                 management_vid: EXAMPLE_MANAGEMENT_VID,
                 node_vid: EXAMPLE_NODE_VID,
                 second_uplink: SecondUplink::Redundant,
+            },
+        ),
+        (
+            "trunk-lag",
+            "Same tagged trunk as trunk, with the uplink on bond0 (ge0+ge1 LACP) instead of \
+             independent cables.",
+            Preset::Trunk {
+                management_vid: EXAMPLE_MANAGEMENT_VID,
+                node_vid: EXAMPLE_NODE_VID,
+                second_uplink: SecondUplink::Lag,
             },
         ),
     ];
@@ -155,6 +177,7 @@ async fn get_presets() -> HttpResponse {
                 PresetView {
                     name,
                     summary,
+                    preset,
                     document,
                     warnings,
                 }
@@ -197,6 +220,10 @@ struct ApplyRequest {
     /// Seconds to wait for a confirmation. Absent means the board's default.
     #[serde(default)]
     window_s: Option<u64>,
+    /// Say yes to replacing an `interfaces` file somebody wrote by hand. The
+    /// confirmed change keeps a copy of it first.
+    #[serde(default)]
+    replace_hand_written: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,8 +261,10 @@ const CONFIRM_FROM_THE_BOARD: &str =
 
 fn refuse(e: SwitchError) -> LegacyResponse {
     match e {
-        SwitchError::Change(_) => LegacyResponse::bad_request(e.to_string()),
-        SwitchError::NoBridge(_) => {
+        SwitchError::Change(_) | SwitchError::MissingBondExecutor(_) => {
+            LegacyResponse::bad_request(e.to_string())
+        }
+        SwitchError::NoBridge(_) | SwitchError::HandWritten(_) => {
             LegacyResponse::Error(actix_web::http::StatusCode::CONFLICT, e.to_string().into())
         }
         other => LegacyResponse::from(anyhow::anyhow!("{other}")),
@@ -273,7 +302,10 @@ async fn put_switch(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_WINDOW);
 
-    let pending = switch.apply(document, window).await.map_err(refuse)?;
+    let pending = switch
+        .apply(document, window, body.replace_hand_written)
+        .await
+        .map_err(refuse)?;
 
     tracing::info!(
         "switch configuration applied by {}, awaiting confirmation within {}s",

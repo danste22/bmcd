@@ -37,11 +37,17 @@
 //! in the middle of an unconfirmed change finds the previous document there,
 //! because the pending one was never written.
 
-use crate::app::switch_applier::{interface_name, plan, Command};
+use crate::app::address_document::{parse, AddressDocument};
+use crate::app::address_service::{keep_a_copy_for_switch, INTERFACES_FILE};
+use crate::app::switch_applier::{interface_name, plan, Command, BOND};
 use crate::app::switch_change::{
     ChangeError, Effect, Pending, RevertRecord, SwitchState, DEFAULT_WINDOW,
 };
-use crate::app::switch_document::{PortId, Preset, SwitchDocument};
+use crate::app::switch_document::{PortId, Preset, SecondUplink, SwitchDocument};
+use crate::app::switch_interfaces::{
+    address_for_rewrite, bond_executor_present, render, switch_from_header, with_interfaces_lock,
+    write_interfaces, HandWrittenInterfaces,
+};
 use crate::utils::write_durably;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -90,6 +96,11 @@ pub enum SwitchError {
     /// `br0`, the bridge over the switch ports, is not there. Nothing was
     /// changed.
     NoBridge(String),
+    /// `/etc/network/interfaces` was written by hand and the request did not
+    /// say to replace it. Nothing was persisted.
+    HandWritten(String),
+    /// LACP needs ifupdown-ng's bond executor so a reboot can bring `bond0` up.
+    MissingBondExecutor(String),
 }
 
 impl std::fmt::Display for SwitchError {
@@ -100,7 +111,9 @@ impl std::fmt::Display for SwitchError {
                 write!(f, "`{command}` failed: {detail}")
             }
             SwitchError::Io(e) => write!(f, "{e}"),
-            SwitchError::NoBridge(m) => write!(f, "{m}"),
+            SwitchError::NoBridge(m)
+            | SwitchError::HandWritten(m)
+            | SwitchError::MissingBondExecutor(m) => write!(f, "{m}"),
         }
     }
 }
@@ -114,6 +127,8 @@ impl From<ChangeError> for SwitchError {
 pub struct SwitchService {
     inner: Mutex<Inner>,
     path: PathBuf,
+    /// `/etc/network/interfaces` twin of the switch document.
+    interfaces_path: PathBuf,
     /// Where to look for `br0`; the kernel's, unless a test says otherwise.
     net_class: PathBuf,
 }
@@ -122,6 +137,8 @@ struct Inner {
     state: SwitchState,
     /// What this daemon last put on the switch.
     running: SwitchDocument,
+    /// Confirm must keep a copy of a hand-written interfaces file first.
+    replaces_hand_written: bool,
 }
 
 impl SwitchService {
@@ -133,9 +150,9 @@ impl SwitchService {
     /// report it, it simply has not put it on the switch.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
-        let persisted: Option<SwitchDocument> = std::fs::read(&path)
+        let persisted = std::fs::read(&path)
             .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok());
+            .and_then(|raw| SwitchDocument::from_json_slice(&raw));
 
         let mut state = SwitchState::default();
         if let Some(document) = persisted.clone() {
@@ -147,9 +164,11 @@ impl SwitchService {
                 state,
                 // Until something is applied, the board is on whatever it
                 // boots as, which is Flat.
-                running: Preset::Flat.expand(),
+                running: Preset::flat().expand(),
+                replaces_hand_written: false,
             }),
             path,
+            interfaces_path: PathBuf::from(INTERFACES_FILE),
             net_class: NET_CLASS.into(),
         }
     }
@@ -158,6 +177,13 @@ impl SwitchService {
     #[cfg(test)]
     pub fn with_net_class(mut self, net_class: impl Into<PathBuf>) -> Self {
         self.net_class = net_class.into();
+        self
+    }
+
+    /// Tests point confirm/heal at a temp interfaces file.
+    #[cfg(test)]
+    pub fn with_interfaces_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.interfaces_path = path.into();
         self
     }
 
@@ -198,7 +224,7 @@ impl SwitchService {
         if is_safemode(Path::new(CMDLINE)) {
             tracing::warn!(
                 "safe mode: the switch configuration is NOT being applied. The board is on its \
-                 default network."
+                 default network. interfaces heal is skipped."
             );
             return Ok(());
         }
@@ -206,7 +232,57 @@ impl SwitchService {
         let Some(document) = inner.state.confirmed().cloned() else {
             return Ok(());
         };
-        let commands = plan(&inner.running, &document);
+
+        let (baseline, skip_rewrite) = with_interfaces_lock(|| -> Result<_, SwitchError> {
+            let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
+            match address_for_rewrite(&disk) {
+                Ok(address) => {
+                    let expected = render(&address, &document);
+                    if disk == expected {
+                        return Ok((None, true));
+                    }
+                    let baseline = match switch_from_header(&disk) {
+                        Some(from_file) => from_file,
+                        None => {
+                            // Image default / no header: ifup brought up stock
+                            // Flat with independent uplinks, not a bond.
+                            tracing::warn!(
+                                "{} has no readable bmcd-switch header; planning from image \
+                                 default flat",
+                                self.interfaces_path.display()
+                            );
+                            Preset::flat().expand()
+                        }
+                    };
+                    write_durably(&self.interfaces_path, expected.as_bytes())
+                        .map_err(SwitchError::Io)?;
+                    tracing::info!(
+                        "healed {} from confirmed switch document",
+                        self.interfaces_path.display()
+                    );
+                    Ok((Some(baseline), false))
+                }
+                Err(HandWrittenInterfaces) => {
+                    tracing::warn!(
+                        "{} is hand-written; switch heal will not rewrite it (live apply only)",
+                        self.interfaces_path.display()
+                    );
+                    Ok((Some(Preset::flat().expand()), true))
+                }
+            }
+        })?;
+
+        if skip_rewrite && baseline.is_none() {
+            inner.running = document;
+            tracing::info!(
+                "switch configuration matches {}; heal skipped",
+                self.interfaces_path.display()
+            );
+            return Ok(());
+        }
+
+        let baseline = baseline.unwrap_or_else(|| Preset::flat().expand());
+        let commands = plan(&baseline, &document);
         run_all(&commands).await?;
         inner.running = document;
         tracing::info!("switch configuration applied from {}", self.path.display());
@@ -229,9 +305,27 @@ impl SwitchService {
         &self,
         document: SwitchDocument,
         window: Duration,
+        replace_hand_written: bool,
     ) -> Result<Pending, SwitchError> {
         self.bridge_check()?;
+        if document.second_uplink == SecondUplink::Lag && !bond_executor_present() {
+            return Err(SwitchError::MissingBondExecutor(
+                "LACP needs ifupdown-ng's bond executor on this image so a reboot can bring \
+                 bond0 up; install it, or use independent uplinks."
+                    .into(),
+            ));
+        }
+
+        let hand_written = with_interfaces_lock(|| {
+            let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
+            matches!(address_for_rewrite(&disk), Err(HandWrittenInterfaces))
+        });
+        if hand_written && !replace_hand_written {
+            return Err(SwitchError::HandWritten(self.hand_written_message()));
+        }
+
         let mut inner = self.inner.lock().await;
+        inner.replaces_hand_written = hand_written;
         let running = inner.running.clone();
         let token = new_token();
         let (pending, effect) =
@@ -240,18 +334,30 @@ impl SwitchService {
                 .apply(document, running, window, SystemTime::now(), token)?;
 
         if let Effect::Apply(document) = effect {
-            let commands = plan(&inner.running, &document);
-            // A failure here leaves the switch part-way, so the pending change
-            // is dropped rather than left waiting for a confirmation that
-            // would persist something that was never fully applied. The window
-            // is not the recovery for this; the caller's error message is.
+            let previous = inner.running.clone();
+            let commands = plan(&previous, &document);
+            // A failure here leaves the switch part-way. Roll back best-effort
+            // with the inverse plan (steps that never ran usually fail too),
+            // then drop the pending change.
             if let Err(e) = run_all(&commands).await {
+                let undo = plan(&document, &previous);
+                run_best_effort(&undo).await;
+                inner.running = previous;
                 let _ = inner.state.revert(SystemTime::now());
                 return Err(e);
             }
             inner.running = document;
         }
         Ok(pending)
+    }
+
+    fn hand_written_message(&self) -> String {
+        let path = self.interfaces_path.display();
+        format!(
+            "{path} was written by hand. A confirmed switch change replaces the whole file (a \
+             copy of the current one is kept as {path}.hand-written.<time>). Send \
+             replace_hand_written to proceed."
+        )
     }
 
     /// Start the window if the uplink carrying the BMC's VLAN is forwarding.
@@ -285,12 +391,16 @@ impl SwitchService {
             return;
         };
 
-        let forwarding = document
-            .members(management)
-            .into_iter()
-            .filter(|port| port.is_uplink())
-            .filter_map(interface_name)
-            .any(|name| is_forwarding(Path::new(NET_CLASS), name));
+        let forwarding = if document.second_uplink == SecondUplink::Lag {
+            is_forwarding(Path::new(NET_CLASS), BOND)
+        } else {
+            document
+                .members(management)
+                .into_iter()
+                .filter(|port| port.is_uplink())
+                .filter_map(interface_name)
+                .any(|name| is_forwarding(Path::new(NET_CLASS), name))
+        };
 
         if forwarding {
             tracing::info!("the uplink is forwarding; the confirm window starts now");
@@ -300,15 +410,71 @@ impl SwitchService {
 
     pub async fn confirm(&self, token: &str) -> Result<(), SwitchError> {
         let mut inner = self.inner.lock().await;
-        let effect = inner.state.confirm(token, SystemTime::now())?;
-        if let Effect::Persist(document) = effect {
-            write_durably(
-                &self.path,
-                &serde_json::to_vec_pretty(&document)
-                    .map_err(|e| SwitchError::Io(std::io::Error::other(e)))?,
-            )
-            .map_err(SwitchError::Io)?;
-            tracing::info!("switch configuration confirmed and persisted");
+        // Check first, write both files, and only then commit. A refusal or a
+        // write that fails leaves the change pending: it can be confirmed
+        // again, or the window puts the old configuration back. `interfaces`
+        // goes first: if `switch.json` then fails, boot heal plans from the
+        // header back to the confirmed document, whereas the other order would
+        // leave a confirmed document nobody confirmed.
+        let document = inner.state.check_confirm(token, SystemTime::now())?;
+        let keep_copy = inner.replaces_hand_written;
+        with_interfaces_lock(|| self.write_interfaces_twin(&document, keep_copy))?;
+        write_durably(
+            &self.path,
+            &serde_json::to_vec_pretty(&document)
+                .map_err(|e| SwitchError::Io(std::io::Error::other(e)))?,
+        )
+        .map_err(SwitchError::Io)?;
+        inner.state.confirm(token, SystemTime::now())?;
+        inner.replaces_hand_written = false;
+        tracing::info!(
+            "switch configuration confirmed and persisted ({}, {})",
+            self.path.display(),
+            self.interfaces_path.display()
+        );
+        Ok(())
+    }
+
+    /// Rewrite `interfaces` for `document`, keeping the address stanza. A
+    /// hand-written file is replaced only with the opt-in from apply, and only
+    /// after a copy is kept; a write that fails removes that copy again.
+    fn write_interfaces_twin(
+        &self,
+        document: &SwitchDocument,
+        keep_copy: bool,
+    ) -> Result<(), SwitchError> {
+        let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
+        let address = match address_for_rewrite(&disk) {
+            Ok(address) => address,
+            // Opt-in already happened at apply; keep a parseable address
+            // from the hand file when we can, else DHCP -- never invent a
+            // static layout from a file we could not read.
+            Err(HandWrittenInterfaces) if keep_copy => {
+                parse(&disk).document.unwrap_or(AddressDocument::Dhcp)
+            }
+            Err(HandWrittenInterfaces) => {
+                return Err(SwitchError::HandWritten(self.hand_written_message()))
+            }
+        };
+        let mut backup = None;
+        if keep_copy && self.interfaces_path.exists() {
+            let (kept, removed) =
+                keep_a_copy_for_switch(&self.interfaces_path).map_err(SwitchError::Io)?;
+            tracing::warn!(
+                "{} was not written by this daemon; a copy is kept as {}",
+                self.interfaces_path.display(),
+                kept.display()
+            );
+            for old in removed {
+                tracing::warn!("removed the older copy {}", old.display());
+            }
+            backup = Some(kept);
+        }
+        if let Err(e) = write_interfaces(&self.interfaces_path, &address, document) {
+            if let Some(kept) = &backup {
+                let _ = std::fs::remove_file(kept);
+            }
+            return Err(SwitchError::Io(e));
         }
         Ok(())
     }
@@ -403,17 +569,31 @@ fn new_token() -> String {
 /// command would cost more than it saved.
 async fn run_all(commands: &[Command]) -> Result<(), SwitchError> {
     for command in commands {
-        let (program, args) = command.split_first().expect("a command has a program");
-        let output = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .map_err(SwitchError::Io)?;
-        if !output.status.success() {
-            return Err(SwitchError::Command {
-                command: command.join(" "),
-                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
+        run_one(command).await?;
+    }
+    Ok(())
+}
+
+/// Inverse-plan rollback: keep going past errors so later undo steps still run.
+async fn run_best_effort(commands: &[Command]) {
+    for command in commands {
+        if let Err(e) = run_one(command).await {
+            tracing::warn!("switch undo step failed: {e}");
         }
+    }
+}
+
+async fn run_one(command: &Command) -> Result<(), SwitchError> {
+    let (program, args) = command.split_first().expect("a command has a program");
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(SwitchError::Io)?;
+    if !output.status.success() {
+        return Err(SwitchError::Command {
+            command: command.join(" "),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
     Ok(())
 }
@@ -422,6 +602,7 @@ async fn run_all(commands: &[Command]) -> Result<(), SwitchError> {
 mod tests {
     use super::*;
     use crate::app::switch_document::SecondUplink;
+    use crate::app::switch_interfaces::{render, switch_from_header, write_interfaces};
 
     fn trunk() -> SwitchDocument {
         Preset::Trunk {
@@ -438,7 +619,7 @@ mod tests {
         let service = SwitchService::load(dir.path().join("switch.json"));
         let view = service.view().await;
         assert_eq!(view.confirmed, None);
-        assert_eq!(view.running, Preset::Flat.expand());
+        assert_eq!(view.running, Preset::flat().expand());
         // No confirmed document means nothing to put on the switch, so this
         // runs no commands and cannot fail on a machine with no bridge.
         service.boot_apply().await.expect("nothing to do");
@@ -457,7 +638,7 @@ mod tests {
         assert_eq!(view.confirmed, Some(trunk()));
         assert_eq!(
             view.running,
-            Preset::Flat.expand(),
+            Preset::flat().expand(),
             "loading is not applying: safe mode depends on those being separate"
         );
     }
@@ -567,7 +748,7 @@ mod tests {
         std::fs::create_dir_all(net.join("br-wan/bridge")).unwrap();
         let service = SwitchService::load(dir.path().join("switch.json")).with_net_class(&net);
         let error = service
-            .apply(Preset::Split.expand(), DEFAULT_WINDOW)
+            .apply(Preset::Split.expand(), DEFAULT_WINDOW, false)
             .await
             .expect_err("no br0");
         let SwitchError::NoBridge(message) = error else {
@@ -592,5 +773,158 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn confirm_dual_writes_interfaces_with_switch_header() {
+        let dir = tempdir::TempDir::new("switch-confirm-ifaces").expect("temp dir");
+        let interfaces = dir.path().join("interfaces");
+        // Persist path shared by confirm: header + bond stanza round-trip.
+        let document = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        write_interfaces(&interfaces, &AddressDocument::Dhcp, &document).unwrap();
+        let text = std::fs::read_to_string(&interfaces).unwrap();
+        assert!(text.contains(crate::app::switch_interfaces::SWITCH_HEADER_PREFIX));
+        assert!(text.contains("auto bond0"));
+        assert_eq!(switch_from_header(&text).expect("header"), document);
+    }
+
+    #[tokio::test]
+    async fn boot_heal_skips_when_interfaces_already_match() {
+        let dir = tempdir::TempDir::new("switch-heal-match").expect("temp dir");
+        let document = Preset::flat().expand();
+        let switch_path = dir.path().join("switch.json");
+        std::fs::write(&switch_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        let interfaces = dir.path().join("interfaces");
+        let text = render(
+            &crate::app::address_document::AddressDocument::Dhcp,
+            &document,
+        );
+        std::fs::write(&interfaces, &text).unwrap();
+
+        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        service.boot_apply().await.expect("heal");
+        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), text);
+        assert_eq!(service.view().await.running, document);
+    }
+
+    /// A hand-written interfaces file is left alone at boot. The confirmed
+    /// document is Flat, so the plan from the image's Flat is empty and the
+    /// test runs no `ip` or `bridge` command on the machine running it.
+    #[tokio::test]
+    async fn boot_heal_does_not_rewrite_a_hand_written_file() {
+        let dir = tempdir::TempDir::new("switch-heal-hand").expect("temp dir");
+        let document = Preset::flat().expand();
+        let switch_path = dir.path().join("switch.json");
+        std::fs::write(&switch_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        let interfaces = dir.path().join("interfaces");
+        std::fs::write(&interfaces, HAND_FILE).unwrap();
+
+        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        service.boot_apply().await.expect("nothing to run");
+        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), HAND_FILE);
+        assert_eq!(service.view().await.running, document);
+    }
+
+    const HAND_FILE: &str =
+        "auto br0\niface br0 inet static\n  address 10.1.2.3\n  netmask 255.255.0.0\n";
+
+    /// A pending change, as `apply` would leave it, without running the plan.
+    async fn pending(service: &SwitchService, document: SwitchDocument) -> String {
+        let mut inner = service.inner.lock().await;
+        let running = inner.running.clone();
+        let token = new_token();
+        inner
+            .state
+            .apply(
+                document,
+                running,
+                DEFAULT_WINDOW,
+                SystemTime::now(),
+                token.clone(),
+            )
+            .expect("a valid document");
+        token
+    }
+
+    /// Without the opt-in, a hand-written file refuses the confirm and nothing
+    /// is persisted: the change stays pending and neither file is touched.
+    #[tokio::test]
+    async fn confirm_over_a_hand_written_file_without_the_opt_in_persists_nothing() {
+        let dir = tempdir::TempDir::new("switch-confirm-hand").expect("temp dir");
+        let switch_path = dir.path().join("switch.json");
+        let interfaces = dir.path().join("interfaces");
+        std::fs::write(&interfaces, HAND_FILE).unwrap();
+        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        let token = pending(&service, trunk()).await;
+
+        let error = service.confirm(&token).await.expect_err("hand-written");
+        assert!(matches!(error, SwitchError::HandWritten(_)), "{error}");
+        assert!(service.view().await.pending.is_some(), "still pending");
+        assert!(!switch_path.exists(), "switch.json not written");
+        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), HAND_FILE);
+    }
+
+    /// With the opt-in, confirm keeps a copy, writes the twin with the
+    /// address from the hand file, then `switch.json`, then commits.
+    #[tokio::test]
+    async fn confirm_with_the_opt_in_keeps_a_copy_and_writes_both_files() {
+        let dir = tempdir::TempDir::new("switch-confirm-opt-in").expect("temp dir");
+        let switch_path = dir.path().join("switch.json");
+        let interfaces = dir.path().join("interfaces");
+        std::fs::write(&interfaces, HAND_FILE).unwrap();
+        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        let token = pending(&service, trunk()).await;
+        service.inner.lock().await.replaces_hand_written = true;
+
+        service.confirm(&token).await.expect("confirm");
+        let view = service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.confirmed, Some(trunk()));
+        let text = std::fs::read_to_string(&interfaces).unwrap();
+        assert_eq!(switch_from_header(&text), Some(trunk()));
+        assert!(text.contains("address 10.1.2.3"), "{text}");
+        assert_eq!(
+            SwitchService::load(&switch_path).view().await.confirmed,
+            Some(trunk())
+        );
+        let copies: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".hand-written."))
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+    }
+
+    /// A failed `interfaces` write leaves the change pending, writes no
+    /// `switch.json`, and does not leave the copy of the hand file behind.
+    #[tokio::test]
+    async fn a_failed_interfaces_write_leaves_the_change_pending() {
+        let dir = tempdir::TempDir::new("switch-confirm-fail").expect("temp dir");
+        let switch_path = dir.path().join("switch.json");
+        // Long enough that the copy fits in 255 bytes but the temp file of
+        // the write does not, so the write fails even for root.
+        let interfaces = dir.path().join("i".repeat(230));
+        std::fs::write(&interfaces, HAND_FILE).unwrap();
+        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        let token = pending(&service, trunk()).await;
+        service.inner.lock().await.replaces_hand_written = true;
+
+        let error = service.confirm(&token).await.expect_err("the write fails");
+        assert!(matches!(error, SwitchError::Io(_)), "{error}");
+        assert!(service.view().await.pending.is_some(), "still pending");
+        assert!(!switch_path.exists(), "switch.json not written");
+        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), HAND_FILE);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains(".hand-written.")),
+            "{names:?}"
+        );
     }
 }

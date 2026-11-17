@@ -249,7 +249,16 @@ impl SwitchState {
     }
 
     /// Keep the change. Only now is anything written down.
-    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+    /// What a confirmation with this token would persist, changing nothing.
+    ///
+    /// Confirming writes two files, so it is check, write, and only then
+    /// [`confirm`](Self::confirm). A write that fails between the two leaves
+    /// the change pending, to be confirmed again or put back by its window.
+    pub fn check_confirm(
+        &self,
+        token: &str,
+        now: SystemTime,
+    ) -> Result<SwitchDocument, ChangeError> {
         let Some(pending) = self.pending.as_ref() else {
             return Err(ChangeError::NothingPending);
         };
@@ -262,8 +271,11 @@ impl SwitchState {
         if pending.expired_at(now) {
             return Err(ChangeError::NothingPending);
         }
+        Ok(pending.document.clone())
+    }
 
-        let document = pending.document.clone();
+    pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
+        let document = self.check_confirm(token, now)?;
         self.confirmed = Some(document.clone());
         self.pending = None;
         Ok(Effect::Persist(document))
@@ -316,7 +328,7 @@ mod tests {
     }
 
     fn flat() -> SwitchDocument {
-        Preset::Flat.expand()
+        Preset::flat().expand()
     }
 
     fn t0() -> SystemTime {

@@ -33,7 +33,10 @@ use crate::app::address_change::{
 };
 use crate::app::address_document::{parse, resolv_conf, AddressDocument};
 use crate::app::network_interfaces::{InterfaceInfo, MANAGED};
-use crate::utils::{write_durably, write_synced};
+use crate::app::switch_document::{Preset, SwitchDocument};
+use crate::app::switch_interfaces::{render, with_interfaces_lock, write_interfaces};
+use crate::app::switch_service::SWITCH_CONFIG;
+use crate::utils::write_synced;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -119,6 +122,8 @@ impl From<ChangeError> for AddressError {
 pub struct AddressService {
     inner: Mutex<Inner>,
     path: PathBuf,
+    /// Confirmed switch document twin; injected so tests stay hermetic.
+    switch_path: PathBuf,
     applier: Applier,
 }
 
@@ -223,6 +228,15 @@ impl AddressService {
 
     /// [`load`](Self::load), on an applier of the caller's choosing.
     pub fn load_with(path: impl AsRef<Path>, applier: Applier) -> Self {
+        Self::load_with_switch(path, SWITCH_CONFIG, applier)
+    }
+
+    /// Tests point at a temp switch.json so confirm/repair never read the host.
+    pub fn load_with_switch(
+        path: impl AsRef<Path>,
+        switch_path: impl AsRef<Path>,
+        applier: Applier,
+    ) -> Self {
         let path = path.as_ref().to_path_buf();
         let read = read_file(&path);
         let mut state = AddressState::default();
@@ -239,6 +253,7 @@ impl AddressService {
                 file_backup: None,
             }),
             path,
+            switch_path: switch_path.as_ref().to_path_buf(),
             applier,
         }
     }
@@ -291,21 +306,28 @@ impl AddressService {
         let mut done = Repair::default();
 
         if inner.file == FileOrigin::Bmcd {
-            let wanted = inner.running.render();
-            let have = std::fs::read_to_string(&self.path).unwrap_or_default();
-            if have != wanted {
-                match write_durably(&self.path, wanted.as_bytes()) {
-                    Ok(()) => {
-                        inner.stamp = modified(&self.path);
-                        done.file_rewritten = true;
-                        tracing::warn!(
-                            "rewrote {}: it was written by an earlier version of this daemon \
-                             and its boot hook could not have run",
-                            self.path.display()
-                        );
-                    }
-                    Err(e) => tracing::error!("could not rewrite {}: {e}", self.path.display()),
+            let switch = load_switch_document(&self.switch_path);
+            let rewritten: std::io::Result<bool> = with_interfaces_lock(|| {
+                let wanted = render(&inner.running, &switch);
+                let have = std::fs::read_to_string(&self.path).unwrap_or_default();
+                if have == wanted {
+                    return Ok(false);
                 }
+                write_interfaces(&self.path, &inner.running, &switch)?;
+                Ok(true)
+            });
+            match rewritten {
+                Ok(true) => {
+                    inner.stamp = modified(&self.path);
+                    done.file_rewritten = true;
+                    tracing::warn!(
+                        "rewrote {}: it was written by an earlier version of this daemon \
+                         and its boot hook could not have run",
+                        self.path.display()
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => tracing::error!("could not rewrite {}: {e}", self.path.display()),
             }
         }
 
@@ -423,25 +445,29 @@ impl AddressService {
         // A file this daemon did not write is replaced whole, so what was in
         // it is kept first. Never overwritten without the copy. The image's
         // own file is nobody's work and is not kept.
-        let mut backup = None;
-        if inner.replaces_hand_written && self.path.exists() {
-            let (kept, removed) = keep_a_copy(&self.path).map_err(AddressError::Io)?;
-            tracing::warn!(
-                "{} was not written by this daemon; a copy is kept as {}",
-                self.path.display(),
-                kept.display()
-            );
-            for old in removed {
-                tracing::warn!("removed the older copy {}", old.display());
+        let switch = load_switch_document(&self.switch_path);
+        let backup = with_interfaces_lock(|| -> Result<Option<PathBuf>, AddressError> {
+            let mut backup = None;
+            if inner.replaces_hand_written && self.path.exists() {
+                let (kept, removed) = keep_a_copy(&self.path).map_err(AddressError::Io)?;
+                tracing::warn!(
+                    "{} was not written by this daemon; a copy is kept as {}",
+                    self.path.display(),
+                    kept.display()
+                );
+                for old in removed {
+                    tracing::warn!("removed the older copy {}", old.display());
+                }
+                backup = Some(kept);
             }
-            backup = Some(kept);
-        }
-        if let Err(e) = write_durably(&self.path, document.render().as_bytes()) {
-            if let Some(kept) = &backup {
-                let _ = std::fs::remove_file(kept);
+            if let Err(e) = write_interfaces(&self.path, &document, &switch).map(|_| ()) {
+                if let Some(kept) = &backup {
+                    let _ = std::fs::remove_file(kept);
+                }
+                return Err(AddressError::Io(e));
             }
-            return Err(AddressError::Io(e));
-        }
+            Ok(backup)
+        })?;
 
         inner
             .state
@@ -512,8 +538,20 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn load_switch_document(path: &Path) -> SwitchDocument {
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| SwitchDocument::from_json_slice(&raw))
+        .unwrap_or_else(|| Preset::flat().expand())
+}
+
 /// How many copies of hand-written files are kept.
 const KEEP_COPIES: usize = 5;
+
+/// Switch confirm reuses the same hand-written backup naming as address confirm.
+pub(crate) fn keep_a_copy_for_switch(path: &Path) -> std::io::Result<(PathBuf, Vec<PathBuf>)> {
+    keep_a_copy(path)
+}
 
 /// Copy `path` to `<path>.hand-written.<unix seconds>`, byte for byte, in the
 /// same directory. Returns where it went and which older copies were removed
@@ -549,7 +587,15 @@ fn keep_a_copy_at(path: &Path, seconds: u64) -> std::io::Result<(PathBuf, Vec<Pa
             };
             let target = path.with_file_name(candidate);
             match std::fs::hard_link(&tmp, &target) {
-                Ok(()) => return Ok(target),
+                Ok(()) => {
+                    // Name the copy durably: UBIFS can lose an unsynced dirent.
+                    if let Some(dir) = path.parent() {
+                        if let Ok(dir_file) = std::fs::File::open(dir) {
+                            let _ = dir_file.sync_all();
+                        }
+                    }
+                    return Ok(target);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
@@ -646,7 +692,10 @@ mod tests {
                 resolvers_written: true
             }
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc.render());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            render(&doc, &Preset::flat().expand())
+        );
         assert_eq!(
             std::fs::read_to_string(&resolv).unwrap(),
             "search home.lan # br0\nnameserver 192.168.1.1 # br0\n"
@@ -672,8 +721,19 @@ mod tests {
         let dhcp = dir.path().join("interfaces-dhcp");
         std::fs::write(&dhcp, AddressDocument::Dhcp.render()).unwrap();
         let done = AddressService::load(&dhcp).repair(&resolv).await;
-        assert_eq!(done, Repair::default());
+        // Address-only render is rewritten to the dual-write twin; resolvers stay empty.
+        assert_eq!(
+            done,
+            Repair {
+                file_rewritten: true,
+                resolvers_written: false
+            }
+        );
         assert_eq!(std::fs::read_to_string(&resolv).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(&dhcp).unwrap(),
+            render(&AddressDocument::Dhcp, &Preset::flat().expand())
+        );
     }
 
     #[test]
@@ -741,13 +801,27 @@ mod tests {
         if let Some(file) = file {
             std::fs::write(&path, file).unwrap();
         }
-        let service = AddressService::load_with(&path, Applier::with(exec.clone(), dir.path()));
+        let switch_path = dir.path().join("switch.json");
+        std::fs::write(
+            &switch_path,
+            serde_json::to_vec_pretty(&Preset::flat().expand()).unwrap(),
+        )
+        .unwrap();
+        let service = AddressService::load_with_switch(
+            &path,
+            &switch_path,
+            Applier::with(exec.clone(), dir.path()),
+        );
         Rig {
             dir,
             file: path,
             exec,
             service,
         }
+    }
+
+    fn twin(address: &AddressDocument) -> String {
+        render(address, &Preset::flat().expand())
     }
 
     fn board(file: Option<&str>, br0: bool) -> Rig {
@@ -878,7 +952,7 @@ mod tests {
         rig.service.confirm(&pending.token).await.expect("confirm");
 
         let written = std::fs::read_to_string(&rig.file).unwrap();
-        assert_eq!(written, lan().render());
+        assert_eq!(written, twin(&lan()));
         let view = rig.service.view().await;
         assert_eq!(view.file, FileOrigin::Bmcd);
         let backup = PathBuf::from(view.file_backup.expect("the copy is reported"));
@@ -933,7 +1007,7 @@ mod tests {
                 .await
                 .expect("the stock file is not somebody's work");
             rig.service.confirm(&pending.token).await.unwrap();
-            assert_eq!(std::fs::read_to_string(&rig.file).unwrap(), lan().render());
+            assert_eq!(std::fs::read_to_string(&rig.file).unwrap(), twin(&lan()));
             // Nobody's work was replaced, so there is nothing to keep.
             assert!(rig.service.view().await.file_backup.is_none());
             assert_eq!(
@@ -1128,8 +1202,12 @@ mod tests {
         let bytes: &[u8] = b"# caf\xe9 uplink\nauto br0\niface br0 inet dhcp\n  bridge-ports ge0\n";
         let rig = board(None, true);
         std::fs::write(&rig.file, bytes).unwrap();
-        let service =
-            AddressService::load_with(&rig.file, Applier::with(rig.exec.clone(), rig.dir.path()));
+        let switch_path = rig.dir.path().join("switch.json");
+        let service = AddressService::load_with_switch(
+            &rig.file,
+            &switch_path,
+            Applier::with(rig.exec.clone(), rig.dir.path()),
+        );
         let view = service.view().await;
         assert_eq!(view.file, FileOrigin::Unreadable);
         assert!(view.configured.is_none());

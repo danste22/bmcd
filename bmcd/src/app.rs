@@ -33,6 +33,7 @@ pub mod switch_applier;
 pub mod switch_change;
 pub mod switch_document;
 pub mod switch_info;
+pub mod switch_interfaces;
 pub mod switch_service;
 pub mod sysfs;
 pub mod thermal_info;

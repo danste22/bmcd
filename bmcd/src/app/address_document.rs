@@ -292,7 +292,7 @@ impl AddressDocument {
 /// board B: the hook with `#` fails with "unterminated quoted string"; the
 /// hook with `\043` writes the file byte-for-byte, `# br0` and all, and
 /// udhcpc's filter still recognises the lines as its own.
-fn hook_argument(resolv: &str) -> String {
+pub(crate) fn hook_argument(resolv: &str) -> String {
     resolv.replace('\n', "\\n").replace('#', "\\043")
 }
 
