@@ -10,6 +10,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Confirmed config files are flushed to flash before rename.**
+  `switch.json`, `/etc/network/interfaces`, access overrides, the managed
+  client CA, and TLS key/cert pairs were written with temp+rename and no
+  `fsync`. On the UBIFS overlay a power cut just after confirm could leave a
+  correctly named empty or truncated file — Flat with no UI error for the
+  switch document, or no network at boot for `interfaces`. One helper,
+  `write_durably`, now syncs the data and the directory (unique temp names;
+  a directory sync failure after rename is not treated as a failed write).
+
 ## [2.43.0] — 2026-11-14
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
