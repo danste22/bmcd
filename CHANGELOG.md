@@ -37,7 +37,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   e.g. `{"preset":"flat","second_uplink":"lag"}`. Confirm requires ifupdown-ng's bond executor. The confirm
   window watches `bond0`. A failed apply runs a best-effort inverse plan.
   Split remains incompatible with LAG. Older `switch.json` files without
-  `second_uplink` infer Off/Redundant/Lag from ports and STP.
+  `second_uplink` infer Off/Redundant/Lag from ports and STP. The bond is
+  created with `xmit_hash_policy layer2+3` and `lacp_rate fast`, live and in
+  the `interfaces` stanza: the switch copies the bond's hash when it joins,
+  and the kernel default `layer2` put two nodes' uploads on one member. With
+  DHCP, `br0` gets `udhcpc-opts "-t 25 -T 2"` so the lease waits for LACP.
 
 - **Switch confirm dual-writes `/etc/network/interfaces`.** One locked writer
   shared with address confirm. A `# bmcd-switch:` header carries the

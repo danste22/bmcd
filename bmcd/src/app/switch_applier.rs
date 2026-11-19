@@ -68,6 +68,11 @@ fn vlan_ports(document: &SwitchDocument) -> Vec<PortId> {
 pub const BOND: &str = "bond0";
 pub const BOND_MODE: &str = "802.3ad";
 pub const BOND_MIIMON: &str = "100";
+/// The RTL8370 trunk copies this at `port_lag_join`: `layer2+3` adds SIP/DIP
+/// to the ASIC hash, so bridged node flows spread across ge0/ge1. The kernel
+/// default `layer2` leaves the IPs out.
+pub const BOND_XMIT_HASH_POLICY: &str = "layer2+3";
+pub const BOND_LACP_RATE: &str = "fast";
 
 /// The bridge every switch port is enslaved to.
 pub const BRIDGE: &str = "br0";
@@ -303,6 +308,10 @@ fn setup_lag() -> Vec<Command> {
             BOND_MODE,
             "miimon",
             BOND_MIIMON,
+            "xmit_hash_policy",
+            BOND_XMIT_HASH_POLICY,
+            "lacp_rate",
+            BOND_LACP_RATE,
         ]),
         cmd(&["ip", "link", "set", "dev", "ge0", "nomaster"]),
         cmd(&["ip", "link", "set", "dev", "ge1", "nomaster"]),
@@ -503,7 +512,9 @@ mod tests {
         .expand();
         let lines = joined(&plan(&flat, &lag));
         assert!(
-            lines.iter().any(|l| l.contains("link add bond0 type bond")),
+            lines.iter().any(|l| l
+                == "ip link add bond0 type bond mode 802.3ad miimon 100 \
+                    xmit_hash_policy layer2+3 lacp_rate fast"),
             "{lines:#?}"
         );
         assert!(

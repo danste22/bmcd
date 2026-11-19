@@ -26,7 +26,10 @@
 use crate::app::address_document::{
     hook_argument, parse, resolv_conf, AddressDocument, INTERFACE, MARKER,
 };
-use crate::app::switch_applier::{interface_name, plan, Command, BOND};
+use crate::app::switch_applier::{
+    interface_name, plan, Command, BOND, BOND_LACP_RATE, BOND_MIIMON, BOND_MODE,
+    BOND_XMIT_HASH_POLICY,
+};
 use crate::app::switch_document::{PortId, Preset, SecondUplink, SwitchDocument};
 use crate::utils::write_durably;
 use std::path::Path;
@@ -108,14 +111,18 @@ pub fn render(address: &AddressDocument, switch: &SwitchDocument) -> String {
 
     let lag = switch.second_uplink == SecondUplink::Lag;
     if lag && bond_executor_present() {
-        out.push_str(
-            "auto bond0\n\
-             iface bond0 inet manual\n\
+        // The bond executor passes every bond-* line to `ip link add`, so
+        // this matches switch_applier's live bond.
+        out.push_str(&format!(
+            "auto {BOND}\n\
+             iface {BOND} inet manual\n\
              \x20 bond-slaves ge0 ge1\n\
-             \x20 bond-mode 802.3ad\n\
-             \x20 bond-miimon 100\n\
-             \n",
-        );
+             \x20 bond-mode {BOND_MODE}\n\
+             \x20 bond-miimon {BOND_MIIMON}\n\
+             \x20 bond-xmit-hash-policy {BOND_XMIT_HASH_POLICY}\n\
+             \x20 bond-lacp-rate {BOND_LACP_RATE}\n\
+             \n"
+        ));
     }
 
     out.push_str(&format!("auto {INTERFACE}\n"));
@@ -128,6 +135,11 @@ pub fn render(address: &AddressDocument, switch: &SwitchDocument) -> String {
                  \x20 wait-delay 15\n\
                  \x20 hostname $(hostname)\n"
             ));
+            if lag {
+                // LACP needs a few seconds to reach Distributing. The default
+                // udhcpc retries (3 x 3 s) give up before that at boot.
+                out.push_str("  udhcpc-opts \"-t 25 -T 2\"\n");
+            }
         }
         AddressDocument::Static(s) => {
             out.push_str(&format!(
@@ -271,6 +283,9 @@ mod tests {
         assert!(text.contains("auto bond0"));
         assert!(text.contains("node1 node2 node3 node4 bond0"));
         assert!(text.contains("bond-mode 802.3ad"));
+        assert!(text.contains("bond-xmit-hash-policy layer2+3"));
+        assert!(text.contains("bond-lacp-rate fast"));
+        assert!(text.contains("udhcpc-opts \"-t 25 -T 2\""));
         assert!(
             !text.contains("link add bond0"),
             "bond comes from the stanza, not post-up"
