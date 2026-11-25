@@ -84,6 +84,10 @@ impl NodeId {
         1 << self as u8
     }
 
+    /// Every node but this one. The real pin controller uses it; the
+    /// simulated one has no USB multiplexer to select, so a `stubbed` build
+    /// never calls it.
+    #[cfg_attr(feature = "stubbed", allow(dead_code))]
     pub fn to_inverse_bitfield(self) -> u8 {
         0b1111 & !(1 << self as u8)
     }
@@ -125,8 +129,8 @@ impl UsbMode {
 
 /// How long a node stays unpowered when it is switched off and on again. Its
 /// rails need that long to drain: switched on sooner, a node that was running
-/// may not cold-boot, and only a cold boot reads the USB boot pin. Both the
-/// real HAL and the stubbed one wait this long in `reset_node`.
+/// may not cold-boot, and only a cold boot reads the USB boot pin.
+/// `BmcApplication` waits this long in a reset, before a flash and after one.
 pub const POWER_OFF_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Which USB topology the board carries. `UsbMux` is the v2.4 multiplexer,
